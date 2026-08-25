@@ -1,0 +1,221 @@
+type tie<class>
+// core/gc/gc.tie —— trm-lite 阶段1：简单 mark-sweep GC（stop-the-world，命名空间 trm_lite_gc）。
+// 对标 trm core/gc 的探针语义：扁平对象图（size/alive/marked）+ 扁平边表（from/to/alive），
+// 精确根集；从根全扫标记（栈预分配、无链式指针），再清扫不可达。
+// 阶段1只做简单 GC 内核语义验证；与执行体内核（core/mnn/sched.tie）正交，后续由
+// 「collect()」薄内置委托调用。
+// 状态全用扁平 table<i64>（对象 id 即下标），规避 tiec 嵌套表复绑定缺陷。
+
+const TRM_LITE_GC_VERSION: string = "0.1.0"
+
+// GCStats：一次收集统计（total = 累计对象数，live = 幸存可达数，freed = 本轮回收数）。
+struct GCStats {
+    var total: i64 = 0
+    var live: i64 = 0
+    var freed: i64 = 0
+}
+
+// ---------- 托管对象表（对象 id 即下标） ----------
+var g_size: table<i64>;           // 对象字节大小
+var g_alive: table<i64>;          // 0/1：是否占用槽位（尚未被 sweep）
+var g_marked: table<i64>;         // 0/1：本次收集是否可达
+
+// ---------- 扁平边表（边 id 即下标；drop 只置 alive=0，不删除/重建） ----------
+var g_edge_from: table<i64>;      // 出边源对象 id
+var g_edge_to: table<i64>;        // 出边目标对象 id
+var g_edge_alive: table<i64>;     // 0/1：该边是否仍生效
+
+// ---------- 根集合 ----------
+var g_roots: table<i64>;          // 精确根集合
+
+namespace trm_lite_gc {
+
+// ---------- 生命周期 ----------
+pub func alloc(size: i64) -> i64 {
+    if size < 0 {
+        return -1
+    }
+    var id: i64 = len(g_size)
+    table_push(g_size, size)
+    table_push(g_alive, 1)
+    table_push(g_marked, 0)
+    return id
+}
+
+// 建立 from → to 引用（追加一条活跃边）。
+pub func add_edge(from: i64, to: i64) {
+    if from < 0 || from >= len(g_alive) || to < 0 || to >= len(g_alive) {
+        return
+    }
+    if g_alive[from] != 1 {
+        return
+    }
+    table_push(g_edge_from, from)
+    table_push(g_edge_to, to)
+    table_push(g_edge_alive, 1)
+}
+
+// 移除对象 from 的第 k 条「活跃出边」（按下标序；alive 置 0，不缩表）。
+pub func drop_edge(from: i64, k: i64) {
+    if from < 0 || from >= len(g_alive) {
+        return
+    }
+    var seen: i64 = 0
+    var e: i64 = 0
+    while e < len(g_edge_from) {
+        if g_edge_alive[e] == 1 && g_edge_from[e] == from {
+            if seen == k {
+                g_edge_alive[e] = 0
+                return
+            }
+            seen = seen + 1
+        }
+        e = e + 1
+    }
+}
+
+pub func add_root(id: i64) {
+    var i: i64 = 0
+    while i < len(g_roots) {
+        if g_roots[i] == id {
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_roots, id)
+}
+
+pub func drop_root(id: i64) {
+    // 去重重建（无缩表原语），回绑全局根集合。
+    var nt = table_new_i64()
+    var j: i64 = 0
+    while j < len(g_roots) {
+        if g_roots[j] != id {
+            table_push(nt, g_roots[j])
+        }
+        j = j + 1
+    }
+    g_roots = nt
+}
+
+// ---------- 访问器（供探针/验收断言） ----------
+pub func obj_size(id: i64) -> i64 {
+    if id < 0 || id >= len(g_size) {
+        return -1
+    }
+    return g_size[id]
+}
+pub func obj_live(id: i64) -> bool {
+    if id < 0 || id >= len(g_alive) {
+        return false
+    }
+    return g_alive[id] == 1
+}
+pub func obj_edge_count(id: i64) -> i64 {
+    var n: i64 = 0
+    var e: i64 = 0
+    while e < len(g_edge_from) {
+        if g_edge_alive[e] == 1 && g_edge_from[e] == id {
+            n = n + 1
+        }
+        e = e + 1
+    }
+    return n
+}
+pub func live_count() -> i64 {
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_alive) {
+        if g_alive[i] == 1 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+pub func alloc_count() -> i64 {
+    return len(g_size)
+}
+pub func root_count() -> i64 {
+    return len(g_roots)
+}
+pub func module_version() -> string {
+    return TRM_LITE_GC_VERSION
+}
+
+// ---------- 主流程：mark + sweep ----------
+// 从根出发做全扫标记：栈预先分配满容量（仅启动时 table_push 增长），热循环内用「索引写」，
+// 出边用扁平边表全扫（规避链式/扩容的 tiec 后端 bug）。返回可达对象数。
+pub func gc_mark() -> i64 {
+    var i: i64 = 0
+    while i < len(g_marked) {
+        g_marked[i] = 0
+        i = i + 1
+    }
+    var cap = len(g_marked)
+    var stack: table<i64> = table_new_i64()
+    var k: i64 = 0
+    while k < cap {
+        table_push(stack, 0)
+        k = k + 1
+    }
+    var sp: i64 = 0
+    var ri: i64 = 0
+    while ri < len(g_roots) {
+        var rid = g_roots[ri]
+        if rid >= 0 && rid < len(g_marked) && g_alive[rid] == 1 {
+            g_marked[rid] = 1
+            stack[sp] = rid
+            sp = sp + 1
+        }
+        ri = ri + 1
+    }
+    while sp > 0 {
+        sp = sp - 1
+        var cur: i64 = stack[sp]
+        var e: i64 = 0
+        // 该对象活边全扫（扁平、无链式指针）
+        while e < len(g_edge_from) {
+            if g_edge_alive[e] == 1 && g_edge_from[e] == cur {
+                var tgt = g_edge_to[e]
+                if tgt >= 0 && tgt < len(g_marked) && g_alive[tgt] == 1 && g_marked[tgt] == 0 {
+                    stack[sp] = tgt
+                    sp = sp + 1
+                    g_marked[tgt] = 1
+                }
+            }
+            e = e + 1
+        }
+    }
+    var cnt: i64 = 0
+    i = 0
+    while i < len(g_marked) {
+        if g_marked[i] == 1 {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// 回收不可达对象；返回释放的对象个数。
+pub func gc_sweep() -> i64 {
+    var freed: i64 = 0
+    var i: i64 = 0
+    while i < len(g_alive) {
+        if g_alive[i] == 1 && g_marked[i] == 0 {
+            g_alive[i] = 0
+            freed = freed + 1
+        }
+        i = i + 1
+    }
+    return freed
+}
+
+// 完整一次收集：mark + sweep。返回统计。
+pub func gc() -> GCStats {
+    var reachable = gc_mark()
+    var freed = gc_sweep()
+    return GCStats(len(g_size), reachable, freed)
+}
+}

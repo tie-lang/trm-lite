@@ -1,0 +1,150 @@
+type tie<class>
+// core/mnn/sched.tie —— trm-lite 阶段1：独立轻量执行体内核（协作式 M:N，命名空间 trm_lite_sched）。
+// 对标 trm core/mnn 的探针语义，作为 trm-lite「简单执行体」的纯 tie 内核：
+//   若干轻量执行体（each = step 上限的「体」）在固定 worker 池（M）上多路复用推进；
+//   一个 tick 至多推进 M 个就绪执行体各一个 step（协作式 yield 的抽象，M:N 上界），
+//   执行体跑满 total_step 即完成；run_all 循环 tick 直至全部完成。
+// 状态用扁平 table<i64>（执行体 id 即下标），规避 tiec 嵌套表复绑定缺陷。
+// 阶段1只做调度内核语义验证；「spawn 真正投递 tie 闭包」的薄内置接线在阶段1后续落地。
+
+const TRM_LITE_SCHED_VERSION: string = "0.1.0"
+
+// SchedResult：调度运行结果（busy_ticks = 有效调度周期，steps = 全部执行体推进总步进，
+// peak_running = 峰值同时运行执行体数，始终 ≤ worker 池 M——即 M:N 上界）。
+struct SchedResult {
+    var busy_ticks: i64 = 0
+    var steps: i64 = 0
+    var peak_running: i64 = 0
+}
+
+// 执行体状态码
+const S_READY: i64 = 0
+const S_RUNNING: i64 = 1
+const S_YIELD: i64 = 2
+const S_DONE: i64 = 3
+
+// ---------- 调度器状态（并行表，执行体 id 即下标） ----------
+var g_worker: i64 = 2                 // worker 池大小 M
+var g_id: table<i64>;                 // 逻辑执行体 id（顺序分配）
+var g_state: table<i64>;              // 状态码
+var g_step: table<i64>;               // 已推进步数
+var g_total: table<i64>;              // 体总步数上限
+var g_rq: table<i64>;                 // 就绪队列（执行体 id）
+var g_run_peak: i64 = 0               // 观测峰值同时运行执行体数（≤ M）
+
+namespace trm_lite_sched {
+
+pub func set_workers(m: i64) {
+    if m < 1 {
+        return
+    }
+    g_worker = m
+}
+pub func workers() -> i64 {
+    return g_worker
+}
+
+// 派生一个执行体（total_step = 体总步数上限）。返回执行体 id。
+pub func spawn(total_step: i64) -> i64 {
+    var cid: i64 = len(g_id)
+    table_push(g_id, cid)
+    table_push(g_state, S_READY)
+    table_push(g_step, 0)
+    table_push(g_total, total_step)
+    table_push(g_rq, cid)
+    return cid
+}
+
+pub func coro_state(id: i64) -> i64 {
+    return g_state[id]
+}
+pub func coro_count() -> i64 {
+    return len(g_id)
+}
+pub func coro_done_step(id: i64) -> i64 {
+    return g_step[id]
+}
+pub func done_count() -> i64 {
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_state) {
+        if g_state[i] == S_DONE {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+pub func active_count() -> i64 {
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_state) {
+        if g_state[i] != S_DONE {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// advance(id)：从就绪队列取一个执行体推进一个 step（协作式 yield 抽象）。
+// 跑满 total_step → S_DONE；否则回到就绪队列。
+func advance(id: i64) {
+    g_state[id] = S_RUNNING
+    g_step[id] = g_step[id] + 1
+    if g_step[id] >= g_total[id] {
+        g_state[id] = S_DONE
+    } else {
+        g_state[id] = S_READY
+        table_push(g_rq, id)
+    }
+}
+
+// tick()：本调度周期至多推进 M 个就绪执行体。返回推进数（0 = 无可推进）。
+pub func tick() -> i64 {
+    var n: i64 = 0
+    var cnt: i64 = 0
+    while n < g_worker && len(g_rq) > 0 {
+        var id: i64 = g_rq[0]
+        g_rq = remove_head(g_rq)
+        advance(id)
+        n = n + 1
+        cnt = cnt + 1
+    }
+    if cnt > g_run_peak {
+        g_run_peak = cnt
+    }
+    return cnt
+}
+
+// run_all()：持续 tick 直到全部完成。返回调度统计（busy_ticks 有效周期、steps 总步进、
+// peak_running 峰值并发——M:N 上界探针）。
+pub func run_all() -> SchedResult {
+    var busy_ticks: i64 = 0
+    var steps: i64 = 0
+    var guard: i64 = 0
+    while active_count() > 0 && guard < 100000 {
+        var p = tick()
+        busy_ticks = busy_ticks + 1
+        steps = steps + p
+        guard = guard + 1
+    }
+    return SchedResult(busy_ticks, steps, g_run_peak)
+}
+
+// 取就绪队列头并删除（无缩表原语：重建）。
+func remove_head(q: table<i64>) -> table<i64> {
+    var n = len(q)
+    var nt = table_new_i64()
+    var i: i64 = 1
+    while i < n {
+        table_push(nt, q[i])
+        i = i + 1
+    }
+    return nt
+}
+
+pub func module_version() -> string {
+    return TRM_LITE_SCHED_VERSION
+}
+}
