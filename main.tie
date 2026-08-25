@@ -1,0 +1,10 @@
+type tie<logic>
+// main.tie：trm-lite 入口占位。
+// 首里程碑实现后，在此汇总 core/gc、core/mnn 与各库层模块回归。
+
+// trm-lite 整体发行版本号。
+const TRM_LITE_VERSION: string = "0.1.0"
+
+func main() {
+    println("trm-lite 骨架：" + TRM_LITE_VERSION)
+}

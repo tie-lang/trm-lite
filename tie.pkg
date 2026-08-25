@@ -1,0 +1,16 @@
+// tie.pkg
+// type tie<data>
+// trm-lite = tie 平台的 Go 式静态内置运行时（Go-like statically-linked runtime）
+// 定位：简单 M:N/GC（tiec 内置原语，供 actor）+ 复杂 M:N/GC（trm-lite 库，import 静态链接）。
+// 与 trm（路线 B 字节码 VM）并行开发、互不干扰。
+
+[
+    "name": "trm-lite",
+    "version": "0.1.0",
+    "description": "tie 平台的 Go 式静态内置运行时",
+    "role": "logic",
+    "main": "main.tie",
+    "author": "houyangbaoxin2009",
+    "license": "TIE-LANG Open Source License v1.0",
+    "dependencies": [],
+]
