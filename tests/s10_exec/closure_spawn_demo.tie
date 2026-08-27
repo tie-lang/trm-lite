@@ -1,0 +1,30 @@
+type tie<logic>
+// closure_spawn_demo.tie —— 闭包字面量修复端到端验收：spawn 直接传闭包字面量。
+var g_done: i64 = 0
+
+func main() {
+    println("== 闭包字面量 spawn 端到端 ==")
+    // 1) 闭包直接作 spawn 实参（返回 i64）
+    var t0 = spawn(func() -> i64 { g_done = g_done + 1; return 10 })
+    // 2) 闭包带参数捕获（实参绑定）
+    var base: i64 = 5
+    var t1 = spawn(func() -> i64 { g_done = g_done + base; return 20 })
+    // 3) 闭包返回 void
+    var t2 = spawn(func() { g_done = g_done + 2 })
+    // 4) 闭包作 var 初始化，再传给 spawn
+    var f3 = func() -> i64 { g_done = g_done + 1; return 30 }
+    var t3 = spawn(f3)
+    // 5) 嵌套：spawn 一个闭包，闭包体内再 spawn（下一轮 drain 执行）
+    var t4 = spawn(func() -> i64 {
+        spawn(func() -> i64 { g_done = g_done + 100; return 0 })
+        return 0
+    })
+    println("[spawn] ids=" + to_string(t0) + "," + to_string(t1) + "," + to_string(t2) + "," + to_string(t3) + "," + to_string(t4))
+    yield()   // 排空队列：1+5+2+1 + 内层100 = 109
+    println("[yield] g_done=" + to_string(g_done))
+    if g_done == 109 {
+        println("闭包字面量端到端验收通过")
+    } else {
+        println("验收失败：g_done=" + to_string(g_done))
+    }
+}

@@ -32,10 +32,11 @@ func task_a() -> i64 {
 }
 
 func main() {
-    var t0 = spawn(task_a)      // 入队轻量执行体（命名函数引用；闭包字面量受解析器限制）
+    var t0 = spawn(func() -> i64 { g_done = g_done + 1; return 0 })  // 闭包字面量直接入队
     var t1 = spawn(task_a)
     yield()                     // 协作式让出：排空就绪任务队列（每个任务一次跑完）
     collect()                   // 简单 mark-sweep GC（返回本轮回收对象数）
+    yield()                     // 排空就绪任务队列（每个任务一次跑完）
     println("done=" + to_string(g_done))
 }
 ```
