@@ -1,23 +1,60 @@
 # trm-lite — tie 平台的 Go 式静态内置运行时
 
-> 状态：**初始化阶段**（仓库骨架 + 设计定稿，未实现）
+> 状态：**阶段 1 进行中**（简单形态内置原语已落地；复杂形态 runtime 库骨架已建，未实现）
 
 trm-lite 为 tie 引入 **Go 式静态内置 runtime** 形态，对标 Go 把调度器/GC 以库形式**静态链接**进单一零依赖二进制。与 trm（字节码 VM，路线 B）**并行开发、互不干扰**。
 
 分两小级：
 
-- **简单 M:N + GC**：作 **tiec 内置原语**（`spawn`/`yield`/channel + 简单 stop-the-world mark-sweep），原生供 actor 使用，零配置。
+- **简单 M:N + GC**：作 **tiec 内置原语**（`spawn`/`yield`/`collect` + 简单 stop-the-world mark-sweep），原生供 actor 使用，零配置、零 import。
 - **复杂 M:N + GC**：作 **trm-lite runtime 库**（work-stealing 调度 + 并发三色 GC + 可迁移栈），`import trm-lite` 触发静态链接进单一二进制。
 
-哲学：**简单形态走纯编译零依赖；复杂形态以库静态内置。** 同源一套 tie 源码，`import` 即选择。
+哲学：**简单形态走纯编译零依赖；复杂形态以库静态内置。** 同源一套 tie 源码，`import` 即选择。**注意：内置与 import 是替代运行时路径，同程序不可混用**（tiec 编译期会明确报错）。
 
-## 权威设计
+## 快速开始（阶段 1 块 2）
 
-架构与验收口径待项目规范后写入 `docs/`（当前以 `tie-main/docs/superpowers/specs/2026-08-26-trm-lite-design.md` 为设计依据）。
+前提：tiec 已支持 `spawn`/`yield`/`collect` 内置（compiler 后端已注册），并已构建 `trm_lite.a`：
 
-## 快速开始
+```powershell
+# 构建静态链接运行时库（一次）
+tiec core/runtime/tl_runtime.tie -o trm_lite.a
+```
 
-（首里程碑实现后填充）
+用户程序直接调用内置（无需 import），tiec 检测到内置时自动静态链接 `trm_lite.a`：
+
+```tie
+type tie<logic>
+var g_done: i64 = 0
+
+func task_a() -> i64 {
+    g_done = g_done + 1
+    return 0
+}
+
+func main() {
+    var t0 = spawn(task_a)      // 入队轻量执行体（命名函数引用；闭包字面量受解析器限制）
+    var t1 = spawn(task_a)
+    yield()                     // 协作式让出：排空就绪任务队列（每个任务一次跑完）
+    collect()                   // 简单 mark-sweep GC（返回本轮回收对象数）
+    println("done=" + to_string(g_done))
+}
+```
+
+编译运行（需指定库位置）：
+
+```powershell
+$env:TIE_TRM_LITE_LIB = "F:\Projects\tie-repo\trm-lite\trm_lite.a"
+tiec spawn_demo.tie -o spawn_demo.exe
+./spawn_demo.exe
+```
+
+内置签名：
+
+- `spawn(f: fn() -> i64 / fn() -> void) -> i64`：入队一个轻量执行体（任务），返回任务 id。
+- `yield() -> void`：协作式让出，排空就绪任务队列。
+- `collect() -> i64`：跑一次 mark-sweep GC，返回本轮回收对象数。
+
+验收载体：`tests/s10_exec/`（`exec_demo` 阶段 1 块 1 内核验收；`spawn_demo`/`spawn_void_demo` 块 2 内置验收）。
 
 ## 工程结构
 
@@ -25,13 +62,18 @@ trm-lite 为 tie 引入 **Go 式静态内置 runtime** 形态，对标 Go 把调
 trm-lite/
 ├── core/
 │   ├── gc/              #  GC（简单：stop-the-world；复杂：并发三色）
-│   └── mnn/             #  M:N 调度（简单：协作；复杂：work-stealing）
+│   ├── mnn/             #  M:N 调度（简单：协作；复杂：work-stealing）
+│   └── runtime/         #  静态链接汇总库（import sched+gc → trm_lite.a）
 ├── lib/                 # 库层业务能力
 ├── tests/               # 验收 / 回归
 ├── docs/                 # 设计文档（独立副本）
 ├── tie.pkg              # 包清单
 └── main.tie             # 入口（占位）
 ```
+
+## 权威设计
+
+架构与验收口径见 `tie-main/docs/superpowers/specs/2026-08-26-trm-lite-design.md`。
 
 ## License
 

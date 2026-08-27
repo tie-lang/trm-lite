@@ -1,0 +1,23 @@
+type tie<logic>
+// spawn_void_demo.tie —— 阶段1块2：验证 spawn 的 void 返回闭包路径（drain 的 retcode=1 分支）。
+var g_done: i64 = 0
+func vtask_a() {
+    println("  [void-task] A")
+    g_done = g_done + 1
+}
+func vtask_b() {
+    println("  [void-task] B")
+    g_done = g_done + 1
+}
+func main() {
+    println("== void 任务 ==")
+    var t0 = spawn(vtask_a)
+    var t1 = spawn(vtask_b)
+    yield()
+    println("[void] g_done=" + to_string(g_done) + " ids=" + to_string(t0) + "," + to_string(t1))
+    if g_done == 2 {
+        println("void 任务验收通过")
+    } else {
+        println("void 任务验收失败")
+    }
+}

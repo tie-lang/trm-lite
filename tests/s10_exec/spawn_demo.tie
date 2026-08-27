@@ -1,0 +1,40 @@
+type tie<logic>
+// spawn_demo.tie —— trm-lite 阶段1块2验收：内置 spawn/yield/collect（无 import）。
+// spawn(f) 入队轻量执行体（f 为命名函数引用或闭包）；yield() 协作式让出并排空
+// 任务队列；collect() 跑 mark-sweep GC。tiec 检测到内置时自动静态链接 trm_lite.a。
+
+var g_done: i64 = 0
+
+func task_a() -> i64 {
+    println("  [task] A 执行（g_done=" + to_string(g_done) + "）")
+    g_done = g_done + 1
+    return 0
+}
+func task_b() -> i64 {
+    println("  [task] B 执行（g_done=" + to_string(g_done) + "）")
+    g_done = g_done + 1
+    return 0
+}
+func task_c() -> i64 {
+    println("  [task] C 执行（g_done=" + to_string(g_done) + "）")
+    g_done = g_done + 1
+    return 0
+}
+
+func main() {
+    println("== trm-lite 阶段1块2：内置 spawn/yield/collect ==")
+    var t0 = spawn(task_a)
+    var t1 = spawn(task_b)
+    var t2 = spawn(task_c)
+    println("[spawn] ids=" + to_string(t0) + "," + to_string(t1) + "," + to_string(t2))
+    println("[yield] 让出，排空就绪任务队列…")
+    yield()
+    println("[yield] 结束，g_done=" + to_string(g_done))
+    var freed = collect()
+    println("[collect] freed=" + to_string(freed))
+    if g_done == 3 {
+        println("阶段1块2 内置原语验收通过")
+    } else {
+        println("阶段1块2 验收失败：g_done=" + to_string(g_done))
+    }
+}

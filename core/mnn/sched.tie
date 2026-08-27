@@ -32,6 +32,37 @@ var g_total: table<i64>;              // 体总步数上限
 var g_rq: table<i64>;                 // 就绪队列（执行体 id）
 var g_run_peak: i64 = 0               // 观测峰值同时运行执行体数（≤ M）
 
+// ---------- 闭包任务队列（阶段1块2：spawn/yield 内置的运行时载体） ----------
+// 每个任务 = 一个「轻量执行体」：{entry, env, retcode}（entry/env 为闭包聚合的
+// 入口/环境指针，i64 承载；retcode = 返回形态编码，0=i64 / 1=void）。
+// 由 tiec 内置 codegen 以 extern 符号调用本组函数；tie 源码侧扁平表存储。
+var g_tq_entry: table<i64>;           // 任务入口指针（entry）
+var g_tq_env: table<i64>;             // 任务环境指针（env）
+var g_tq_retcode: table<i64>;         // 任务返回形态编码
+
+// 任务返回形态编码（与 tiec builtin_expr 的 drain 分派对齐）
+const RET_I64: i64 = 0
+const RET_VOID: i64 = 1
+
+// ---------- 表全局惰性初始化（阶段1块2：trm_lite.a 静态链接时 main 不会初始化
+// 库内表全局——@g = global ptr null，须在桥函数首次调用时创建；import 内联时
+// main 已初始化，本函数幂等无害） ----------
+var g_tl_sched_init: i64 = 0
+
+func tl_sched_ensure() {
+    if g_tl_sched_init == 0 {
+        g_id = table_new_i64()
+        g_state = table_new_i64()
+        g_step = table_new_i64()
+        g_total = table_new_i64()
+        g_rq = table_new_i64()
+        g_tq_entry = table_new_i64()
+        g_tq_env = table_new_i64()
+        g_tq_retcode = table_new_i64()
+        g_tl_sched_init = 1
+    }
+}
+
 namespace trm_lite_sched {
 
 pub func set_workers(m: i64) {
@@ -130,6 +161,61 @@ pub func run_all() -> SchedResult {
         guard = guard + 1
     }
     return SchedResult(busy_ticks, steps, g_run_peak)
+}
+
+// ---------- 阶段1块2：闭包任务队列（spawn/yield 内置运行时） ----------
+// spawn_task：入队一个轻量执行体（闭包入口/环境/返回形态）。返回任务 id。
+pub func spawn_task(entry: i64, env: i64, retcode: i64) -> i64 {
+    tl_sched_ensure()
+    var id: i64 = len(g_tq_entry)
+    table_push(g_tq_entry, entry)
+    table_push(g_tq_env, env)
+    table_push(g_tq_retcode, retcode)
+    return id
+}
+pub func queued_count() -> i64 {
+    tl_sched_ensure()
+    return len(g_tq_entry)
+}
+// 队头任务三要素（drain 分派用；空队列返回 0）。
+pub func queued_entry() -> i64 {
+    tl_sched_ensure()
+    if len(g_tq_entry) == 0 {
+        return 0
+    }
+    return g_tq_entry[0]
+}
+pub func queued_env() -> i64 {
+    tl_sched_ensure()
+    if len(g_tq_entry) == 0 {
+        return 0
+    }
+    return g_tq_env[0]
+}
+pub func queued_retcode() -> i64 {
+    tl_sched_ensure()
+    if len(g_tq_entry) == 0 {
+        return 0
+    }
+    return g_tq_retcode[0]
+}
+// 移除队头任务（无缩表原语：并行表重建）。
+pub func queued_dequeue() {
+    tl_sched_ensure()
+    var ne = table_new_i64()
+    var nv = table_new_i64()
+    var nr = table_new_i64()
+    var n = len(g_tq_entry)
+    var i: i64 = 1
+    while i < n {
+        table_push(ne, g_tq_entry[i])
+        table_push(nv, g_tq_env[i])
+        table_push(nr, g_tq_retcode[i])
+        i = i + 1
+    }
+    g_tq_entry = ne
+    g_tq_env = nv
+    g_tq_retcode = nr
 }
 
 // 取就绪队列头并删除（无缩表原语：重建）。

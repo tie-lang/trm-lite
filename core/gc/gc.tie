@@ -28,6 +28,23 @@ var g_edge_alive: table<i64>;     // 0/1：该边是否仍生效
 // ---------- 根集合 ----------
 var g_roots: table<i64>;          // 精确根集合
 
+// ---------- 表全局惰性初始化（阶段1块2：trm_lite.a 静态链接时 main 不初始化库内
+// 表全局，桥函数首次调用时创建；import 内联时幂等无害） ----------
+var g_tl_gc_init: i64 = 0
+
+func tl_gc_ensure() {
+    if g_tl_gc_init == 0 {
+        g_size = table_new_i64()
+        g_alive = table_new_i64()
+        g_marked = table_new_i64()
+        g_edge_from = table_new_i64()
+        g_edge_to = table_new_i64()
+        g_edge_alive = table_new_i64()
+        g_roots = table_new_i64()
+        g_tl_gc_init = 1
+    }
+}
+
 namespace trm_lite_gc {
 
 // ---------- 生命周期 ----------
@@ -217,5 +234,12 @@ pub func gc() -> GCStats {
     var reachable = gc_mark()
     var freed = gc_sweep()
     return GCStats(len(g_size), reachable, freed)
+}
+
+// 阶段1块2：collect() 内置委托——完整一次收集，返回本轮回收对象数（i64，extern ABI 扁平）。
+pub func collect() -> i64 {
+    tl_gc_ensure()
+    var s = gc()
+    return s.freed
 }
 }

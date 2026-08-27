@@ -1,0 +1,16 @@
+type tie<class>
+// core/runtime/tl_runtime.tie —— trm-lite 静态链接运行时汇总库（阶段1块2）
+// 供 tiec 内置原语（spawn/yield/collect）**静态链接**：导入 sched/gc 两个内核
+// 模块，编译为单一 trm_lite.a。内置 codegen 以 extern 符号调用
+// trm_lite_sched$spawn_task / trm_lite_sched$queued_* / trm_lite_gc$collect。
+// 用户程序无需 import 本库——tiec 检测到 spawn/yield/collect 内置时自动链接。
+import "../../core/mnn/sched.tie"
+import "../../core/gc/gc.tie"
+
+namespace tl_runtime {
+
+// 汇总库版本（占位，供库自检/探针；内置本身不依赖本函数）。
+pub func runtime_version() -> string {
+    return "0.1.0"
+}
+}
