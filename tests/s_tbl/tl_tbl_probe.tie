@@ -1,0 +1,56 @@
+type tie<logic>
+// ============================================================
+// trm-lite tl_tbl 字节层表容器单测（P2a）
+// 覆盖：new/len/ensure/at/set、扩容边界、越界零值/静默、扩容数据保留。
+// 期望输出：3 1 22 1 99 0 0 0 44 22
+// ============================================================
+import "../../core/tbl/tl_tbl.tie"
+
+func main() {
+    unsafe {
+        // 1. 建表 esz=8，扩容到 3，写入 3 个 i64 元素（data 为 i64 指针整数）
+        var h = tl_tbl.tbl_new(8)
+        var data = tl_tbl.tbl_ensure(h, 3)
+        deref_write(int_to_ptr(data + 0), 11)
+        deref_write(int_to_ptr(data + 8), 22)
+        deref_write(int_to_ptr(data + 16), 33)
+        tl_tbl.tbl_set_len(h, 3)
+        println(to_string(tl_tbl.tbl_len(h)))          // 3
+
+        // 2. 下标读
+        var out = alloc(8)
+        var ok = tl_tbl.tbl_at(h, 1, ptr_to_int(out))
+        println(to_string(ok))                          // 1
+        println(to_string(deref(out)))                  // 22
+
+        // 3. 下标写（覆盖元素 0）
+        var src = alloc(8)
+        deref_write(src, 99)
+        var ok2 = tl_tbl.tbl_set(h, 0, ptr_to_int(src))
+        println(to_string(ok2))                         // 1
+        var ok3 = tl_tbl.tbl_at(h, 0, ptr_to_int(out))
+        println(to_string(deref(out)))                  // 99
+
+        // 4. 越界读：ok=0 + 零值
+        var ok4 = tl_tbl.tbl_at(h, 9, ptr_to_int(out))
+        println(to_string(ok4))                         // 0
+        println(to_string(deref(out)))                  // 0
+
+        // 5. 越界写：ok=0（静默）
+        var ok5 = tl_tbl.tbl_set(h, 9, ptr_to_int(src))
+        println(to_string(ok5))                         // 0
+
+        // 6. 扩容后数据保留（push 到 5 个触发 1.5x）
+        var data2 = tl_tbl.tbl_ensure(h, 5)
+        deref_write(int_to_ptr(data2 + 32), 44)
+        deref_write(int_to_ptr(data2 + 40), 55)
+        tl_tbl.tbl_set_len(h, 5)
+        var ok6 = tl_tbl.tbl_at(h, 4, ptr_to_int(out))
+        println(to_string(deref(out)))                  // 44（扩容后新元素）
+        var ok7 = tl_tbl.tbl_at(h, 1, ptr_to_int(out))
+        println(to_string(deref(out)))                  // 22（扩容后旧元素保留）
+
+        free(out)
+        free(src)
+    }
+}
