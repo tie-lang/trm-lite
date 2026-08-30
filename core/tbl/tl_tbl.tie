@@ -1,0 +1,117 @@
+type tie<class>
+// core/tbl/tl_tbl.tie —— trm-lite 字节层表容器（命名空间 tl_tbl）。
+// ============================================================
+// 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 32 字节句柄
+//   {cap@0, len@8, data@16, esz@24}（cap/len/esz 为 i64，data 为原始字节
+//   缓冲指针，均以 i64 承载）。tiec 以 extern 符号调用 tl_tbl$tbl_*。
+// 纯 unsafe/ptr 裸内存实现（**零 table<T> 依赖**）——保证 trm_lite.a 可被
+// 任意表 codegen 的 tiec 重建而无自引用环（tbl_at 若用 table<i64> 记账会
+// 在「新表 codegen」下自调自身形成无限递归）。
+// 用户程序无需 import 本库——tiec 检测到表内置时自动链接。
+// 扩容语义对齐编译器旧内联 s21_table_grow：newcap = cap==0 ? max(8,need)
+//   : max(cap+cap/2, need)；新缓冲 alloc(newcap*esz) + memcpy 旧 len*esz 字节。
+
+namespace tl_tbl {
+
+// ---------- 句柄 i64 字段逐字节读写 ----------
+// deref/deref_write 对 ptr<u8> 是单字节存取，i64 字段须 8 字节组装。
+unsafe fn w_i64(p: ptr<u8>, off: i64, v: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        deref_write(int_to_ptr(ptr_to_int(p) + off + k), (v >> (k * 8)) & 255)
+        k = k + 1
+    }
+}
+
+unsafe fn r_i64(p: ptr<u8>, off: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = deref(int_to_ptr(ptr_to_int(p) + off + k))
+        v = v | (b << (k * 8))
+        k = k + 1
+    }
+    return v
+}
+
+// 建空表：esz = 元素字节大小。返回句柄（i64 = 32 字节块指针）。
+pub unsafe fn tbl_new(esz: i64) -> i64 {
+    var h = alloc(32)
+    w_i64(h, 0, 0)     // cap = 0
+    w_i64(h, 8, 0)     // len = 0
+    w_i64(h, 16, 0)    // data = null
+    w_i64(h, 24, esz)  // esz = 元素字节大小
+    return ptr_to_int(h)
+}
+
+// 表长度：len(t) = [h+8]。
+pub unsafe fn tbl_len(h: i64) -> i64 {
+    return r_i64(int_to_ptr(h), 8)
+}
+
+// 元素字节大小（容器内部 at/set/ensure 用；tiec 侧用编译期尺寸）。
+pub unsafe fn tbl_esz(h: i64) -> i64 {
+    return r_i64(int_to_ptr(h), 24)
+}
+
+// 扩容：若 need > cap → 增长（cap=0→8，否则 1.5x，至少 need）。
+// 返回 data ptr（i64）；扩容后缓冲可能换址。
+pub unsafe fn tbl_ensure(h: i64, need: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var cap = r_i64(p, 0)
+    var len = r_i64(p, 8)
+    var data = r_i64(p, 16)
+    var esz = r_i64(p, 24)
+    if need > cap {
+        var newcap: i64 = 8
+        if cap > 0 {
+            newcap = cap + cap / 2
+        }
+        if newcap < need {
+            newcap = need
+        }
+        var nd = alloc(newcap * esz)
+        if data != 0 {
+            memcpy(nd, int_to_ptr(data), len * esz)   // nd 已是 ptr；data 为 i64
+            free(int_to_ptr(data))
+        }
+        w_i64(p, 16, ptr_to_int(nd))
+        w_i64(p, 0, newcap)
+        return ptr_to_int(nd)
+    }
+    return data
+}
+
+// 提交新长度（push 后调用）。
+pub unsafe fn tbl_set_len(h: i64, n: i64) {
+    w_i64(int_to_ptr(h), 8, n)
+}
+
+// 表下标读：越界 → 写零 out（esz 字节）返回 0；否则拷 data+i*esz → out 返回 1。
+pub unsafe fn tbl_at(h: i64, i: i64, out: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24)
+    var data = r_i64(p, 16)
+    if i < len {
+        memcpy(int_to_ptr(out), int_to_ptr(data + i * esz), esz)
+        return 1
+    }
+    memset(int_to_ptr(out), 0, esz)
+    return 0
+}
+
+// 表下标写：越界静默返回 0；否则拷 src → data+i*esz 返回 1。
+pub unsafe fn tbl_set(h: i64, i: i64, src: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24)
+    var data = r_i64(p, 16)
+    if i < len {
+        memcpy(int_to_ptr(data + i * esz), int_to_ptr(src), esz)
+        return 1
+    }
+    return 0
+}
+
+}

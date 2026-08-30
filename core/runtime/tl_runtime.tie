@@ -4,8 +4,11 @@ type tie<class>
 // 模块，编译为单一 trm_lite.a。内置 codegen 以 extern 符号调用
 // trm_lite_sched$spawn_task / trm_lite_sched$queued_* / trm_lite_gc$collect。
 // 用户程序无需 import 本库——tiec 检测到 spawn/yield/collect 内置时自动链接。
+// P2a（2026-08-30）：新增 tl_tbl 字节层表容器（tl_tbl$tbl_*），tiec 检测到
+// 表内置时自动链接；tl_tbl 零 table 依赖（纯 unsafe/ptr），自举无环。
 import "../../core/mnn/sched.tie"
 import "../../core/gc/gc.tie"
+import "../../core/tbl/tl_tbl.tie"
 
 namespace tl_runtime {
 
