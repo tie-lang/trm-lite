@@ -2,6 +2,38 @@
 
 ## preview.2 — 2026-09-02
 
+- **p.6.5.11 收尾**：preview.2 发布——README 全景更新（复杂形态入口全集 + 已知限制
+  清单）；自举核验：新 tiec 编译自身字节一致（tiec2 4032512 字节），简单 spawn/demo
+  零回归；channel 构件 `tl_chan_lib.tie` 独立切片并入 `trm_lite.a` 的构建约定文档化。
+
+- **p.6.5.10 回归与对比**：m6_actor 15 正向探针零回归（9 显式 PASS + 5 语义打印
+  exit 0 + panic_raise 预期非零）+ 10 负例编译期拒绝；简单 vs 复杂行为一致——
+  同一「生产者×channel→消费者」逻辑内置（parity_chan sum=804）与复杂
+  （combo_demo ctx_ch sum=804）逐字节一致。
+
+- **p.6.5.9 双形态验收 demo**：`combo_demo`（复杂：work-stealing 池 + mailbox 8
+  消息取回 + 16 任务分配 96 槽/32 活/64 垃圾后台并发回收 + 执行器分布）；`
+  combo_simple_demo`（简单：actor mailbox FIFO + 内置 channel + spawn 闭包
+  10/45/190 + collect），两形态 exit 0 + 计数精确。
+
+- **p.6.5.8 actor × 复杂形态咬合**：
+  - actor 消息入口改经 **channel mailbox**：`actor_task` 从 record@56 的通道句柄
+    `ch_recv` 取 method_id（替代直读单槽），发送方 `ch_send` 入队后 spawn 任务；
+    单消息槽串行护栏保留（async FIFO 精确，actor_a4_async count=7 佐证）。
+  - `#[unsafe.trm]` actor 级接入门接受（通用 `#[]` 属性通道白名单，语法零改动）；
+    探针 actor_trm_demo：async 多参 FIFO total=96 PASS。
+- **p.6.5.7 channel 语言原语**：
+  - `core/chan/tl_chan.tie`：环形缓冲 mailbox（互斥 + 条件变量），FIFO、关闭标志、
+    满/空语义（send 0=成功 1=失败；recv 值/0=空/-1=关闭空）。
+  - tiec 三处注册 `ch_open/ch_send/ch_recv/ch_close` 内置（is_builtin_name /
+    builtin_call / ensure_builtins + codegen 静态链接 trm_lite_chan$* + 冲突检测）。
+  - 验收：chan_demo（FIFO/空/关闭/满容量 64）PASS；自举二阶段字节一致。
+- **p.6.5.6 精确根拍板**：「任务 env 即根」——闭包 env 引用根集合由 add_root +
+  写屏障维护，sweep 仅在无任务窗口执行；root_protect_demo（运行中对象不回收、
+  结束后收敛 0 无泄漏）PASS。设计 §9 待决项 3 定案写入任务书文档。
+- **p.6.5.5 可迁移栈语义落位**：任务与创建 worker 解耦（任意 worker 可执行），
+  执行 worker 登记 `g_exec_w` + 迁移计数 `g_migrated`（worker≠创建者即迁移）；
+  ctx_migrated/ctx_task_exec_w 观察量；mig_demo（24 任务分布 4 worker）PASS。
 - **p.6.5.4 分代 + mark-compact 回收**（新生代/老年代 minor + 老年代整理回收）：
   - 年龄表 `g_o_age` + 晋升阈值 `TG_AGE_T`：存活 minor 轮 ≥2 → 老年代。
   - minor（半代）：young 全白 + 老年代预黑；种子 = 全根 + 记忆集 `g_c_rs`；

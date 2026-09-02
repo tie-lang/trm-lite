@@ -1,13 +1,13 @@
 # trm-lite — tie 平台的 Go 式静态内置运行时
 
-> 状态：**阶段 2 进行中**（简单形态内置原语已落地；复杂形态静态链接外壳已起，work-stealing/并发三色 GC/可迁移栈 依 p.6.5 切片推进）
+> 状态：**preview.2**（p.6.5 完成：复杂形态 work-stealing 调度 + 并发三色 GC（分代/整理）+ 可迁移栈 + channel 语言原语 + actor mailbox 咬合）
 
 trm-lite 为 tie 引入 **Go 式静态内置 runtime** 形态，对标 Go 把调度器/GC 以库形式**静态链接**进单一零依赖二进制。与 trm（字节码 VM，路线 B）**并行开发、互不干扰**。
 
 分两小级：
 
-- **简单 M:N + GC**：作 **tiec 内置原语**（`spawn`/`yield`/`collect` + 简单 stop-the-world mark-sweep），原生供 actor 使用，零配置、零 import。
-- **复杂 M:N + GC**：作 **trm-lite runtime 库**（work-stealing 调度 + 并发三色 GC + 可迁移栈），`import trm-lite` 触发静态链接进单一二进制。
+- **简单 M:N + GC**：作 **tiec 内置原语**（`spawn`/`yield`/`collect` + `ch_open`/`ch_send`/`ch_recv`/`ch_close` + 简单 stop-the-world mark-sweep），原生供 actor 使用，零配置、零 import。
+- **复杂 M:N + GC**：作 **trm-lite runtime 库**（work-stealing 调度 + 并发三色 GC + 分代/整理 + 可迁移语义 + mailbox），`import trm-lite` 触发静态链接进单一二进制。
 
 哲学：**简单形态走纯编译零依赖；复杂形态以库静态内置。** 同源一套 tie 源码，`import` 即选择。**注意：内置与 import 是替代运行时路径，同程序不可混用**（tiec 编译期会明确报错）。
 
@@ -54,6 +54,10 @@ tiec spawn_demo.tie -o spawn_demo.exe
 - `spawn(f: fn() -> i64 / fn() -> void) -> i64`：入队一个轻量执行体（任务），返回任务 id。
 - `yield() -> void`：协作式让出，排空就绪任务队列。
 - `collect() -> i64`：跑一次 mark-sweep GC，返回本轮回收对象数。
+- `ch_open() -> i64`：分配新 channel（mailbox），返回句柄（1 起）。p.6.5.7。
+- `ch_send(ch, v) -> i64`：入队消息；**0**=成功，**1**=失败（通道关闭或队列满）。
+- `ch_recv(ch) -> i64`：取队首消息；**v**=消息值，**0**=空(未关)，**-1**=已关闭且排空。
+- `ch_close(ch) -> void`：置关闭位（幂等），唤醒等待者。
 
 验收载体：`tests/s10_exec/`（`exec_demo` 阶段 1 块 1 内核验收；`spawn_demo`/`spawn_void_demo` 块 2 内置验收）。
 
@@ -91,26 +95,52 @@ func main() {
 - `ctx_collect() -> i64`：并发三色 GC 已回收对象总数（p.6.5.3；后台回收器随
   drain 与 worker 真并发推进，sweep 在无任务窗口执行）
 - `ctx_live_objs()` / `ctx_gc_steps()` / `ctx_gc_rounds()`：GC 观察量（存活数 / 标记推进步数 / 回收轮数）
+- `ctx_minor_runs()` / `ctx_major_runs()` / `ctx_minor_freed()` / `ctx_compacted()`：
+  分代观察量（p.6.5.4）；`ctx_gc_minor()` / `ctx_gc_major()` 同步触发代际回收
+- `ctx_remapped(old)` / `ctx_obj_alive(id)` / `ctx_obj_age(id)`：mark-compact 后查询（p.6.5.4）
+- `ctx_migrated()` / `ctx_task_exec_w(id)`：可迁移栈观察量（p.6.5.5）
 - `ctx_stolen() -> i64` / `ctx_completed() -> i64`：跨轮累计窃取/完成任务数（验收观察量）
+- `ctx_ch_open()` / `ctx_ch_send(ch,v)` / `ctx_ch_recv(ch)` / `ctx_ch_close(ch)` /
+  `ctx_ch_len(ch)` / `ctx_ch_count()`：channel/mailbox 入口（p.6.5.7，复杂形态）
 - `ctx_version() -> string`
 
-托管堆（p.6.5.3，供 GC 探针/后续组织）：`trm_lite_tgc` 提供
-`alloc(size) -> id` / `set_ref(from,k,to)`（写屏障）/ `drop_ref` / `add_root|drop_root`（保守根）/
-`gc_collect_sync()`（同步收集，断言用）。精确栈图（p.6.5.6）前根为保守登记 + 写屏障不变量。
+托管堆（p.6.5.3/6.5.4）：`trm_lite_tgc` 提供 `alloc(size) -> id` / `set_ref(from,k,to)`
+（写屏障：Dijkstra 黑→白 置灰 + 老→新记 remembered set）/ `drop_ref` /
+`add_root|drop_root`（保守根）`gc_minor_sync()` / `gc_collect_sync()`（同步收集，断言用）。
+分代：新生代/老年代（`TG_AGE_T=2` 晋升阈值）；minor 只收 young（老年代预黑保护）；
+major = 全量三色 + mark-compact（存活重排前段 + 边/根重写 + `remapped()` 查询）。
+精确根定义（p.6.5.6 拍板）：任务闭包 env 引用根集合（`add_root` + 写屏障维护），
+运行时 sweep 仅在「无任务窗口」（pending==0 && active==0）执行。
 
-限制（文档明示）：任务为 `fn() -> i64` 原子执行体，运行中不可被抢占；
-抢占体现为调度级（任务边界让出 + 窃取均衡），时间片硬抢占待 p.6.5.5 可迁移栈。
-跨任务可见状态请用全局/独立槽位（局部捕获是 env 副本）。
+## 已知限制（preview.2）
 
-验收载体：`tests/s65_ctx/ctx_shell_demo.tie`（正向 exit 0）；`tie-main/tests/_p651_probe/ctx_mix_neg.tie`（复杂 import + 内置 spawn → 编译期报错）。
+- 任务为 `fn() -> i64` 原子执行体，运行中不可抢占；抢占体现为调度级（任务边界
+  让出 + 窃取均衡），时间片硬中断待语言级支持。「可迁移栈」语义落位为任务与
+  创建 worker 解耦（任意 worker 可执行 + 迁移计数），非 OS 级协程栈迁移。
+- 精确根为「任务 env 即根」保守口径：任务运行期未显式登根/未建引用边的局部临时
+  对象依赖「无任务窗口」而非逐帧栈图（精度损失已文档化，root_protect_demo 佐证）。
+- `ch_recv` 空队列（未关）返回 0（非阻塞降级），需调用方轮询/配合消息已达性约定；
+  `ch_send` 队满返回 1（非阻塞降级）。Go 的阻塞 send/recv 语义需语言级挂起能力，
+  当前以返回值协商替代（复杂形态任务内可用 cv 等待，见 `ch_recv` 内部实现）。
+- channel 消息为标量 i64；对象/表消息需经 root 登记承载（p.6.5.8 actor 消息经
+  单消息槽 + mailbox 令牌）。
+- actor 由 trm-lite 承载（内置 spawn/collect 路径）：`#[unsafe.trm]` 标注作为
+  显式接入确认（语法零改动，p.6.5.8）；actor 与 import trm-lite 混用 → 编译期报错。
+- tie 相关既有缺陷（沿用，非本次引入）：标量全局初值静默丢弃（`=4` 实际 0）、
+  `to_string(bool)` 输出 `-1`（true）/`0`（false）、顶层 `table<T>` 全局须带 `= []`
+  初始化、单行块语句须以 `;` 结尾。
+- 复杂形态汇总库（import tl_runtime_ctx 或多模块聚合 import）的重编译受 LLVM opt
+  严格 declare+define 同模块冲突约束：channel 切片以 `tl_chan_lib.tie` 独立构件
+  并入 `trm_lite.a`（构建方法见仓库）。
 
 ## 工程结构
 
 ```
 trm-lite/
 ├── core/
-│   ├── gc/              #  GC（简单：stop-the-world；复杂：并发三色）
-│   ├── mnn/             #  M:N 调度（简单：协作；复杂：work-stealing）
+│   ├── gc/              #  GC（简单：stop-the-world；复杂：并发三色 + 分代 + mark-compact）
+│   ├── mnn/             #  M:N 调度（简单：协作；复杂：work-stealing + 可迁移语义）
+│   ├── chan/            #  channel/mailbox（环形缓冲 + 互斥/条件变量，p.6.5.7）
 │   └── runtime/         #  静态链接汇总库（import sched+gc → trm_lite.a）
 ├── lib/                 # 库层业务能力
 ├── tests/               # 验收 / 回归
