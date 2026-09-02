@@ -1,47 +1,77 @@
 type tie<class>
-// core/gc/gc_tri.tie —— trm-lite 复杂形态并发三色 GC（p.6.5.3）
+// core/gc/gc_tri.tie —— trm-lite 复杂形态 GC（p.6.5.3 并发三色 / p.6.5.4 分代 + 整理）
 // 托管堆模型（tie 可表达的扁平对象图，对象 id 即下标）：
-//   对象表 g_o_size/g_o_alive/g_o_color（并行 table<i64>）
+//   对象表 g_o_size/g_o_alive/g_o_color/g_o_age（并行 table<i64>；age 分代）
 //   边表   g_e_from/g_e_to/g_e_alive（from→to 引用，alive=生效）
-//   根表   g_c_roots（**保守根**；g_c_ 前缀规避旧 trm_lite.a 内同名全局的链接期冲突：显式 add_root 登记；语言精确栈图
-//          尚未落地（p.6.5.6）前，任务栈/env 内引用经写屏障维持不变量，
-//          sweep 仅发生在无任务运行窗口 ⇒ 保守根 + 不变量即正确集）
-// 三色：0=白（未标记）1=灰（标记栈中）2=黑（已扫）
-// 并发模型（与 trm_lite_ws 的 worker 真并行）：
-//   独立 GC 锁 g_gc_cs 保护本模块全部状态；写屏障与标记推进互斥；
-//   调度侧保证 sweep 只在「无任务运行」（pending==0&&active==0）后发生，
-//   此窗口无写屏障 ⇒ sweep 无并发写。标记/写屏障无锁交叉（GC 线程绝不
-//   嵌套持有调度锁 g_cs）。
-// 写屏障（Dijkstra 不变量「黑不指向白」）：set_ref 写入黑→白 引用时，
-//   目标置灰压栈——并发标记不漏标。
-// 分代/整理（p.6.5.4）/ 精确栈图（p.6.5.6）后置。
+//   根表   g_c_roots（保守根：显式 add_root；精确栈图 p.6.5.6 前任务 env 内引用
+//          经写屏障维持不变量，sweep 仅无任务窗口执行）
+//   记集   g_c_rs（remembered set：老年代→新生代 引用目标，minor 种子）
+//   三色   0=白 1=灰 2=黑
+// 分代（p.6.5.4）：
+//   · 新生代 age<TG_AGE_T，老年代 age>=TG_AGE_T
+//   · minor（半代）：重置 young 白 + 老黑；种子 = 全根 + rs；标记；sweep 只回收
+//     young 白；存活 young age++（达阈值晋升）。老年代不被 young sweep。
+//   · major：全量三色回收（同 p.6.5.3）+ **mark-compact**：存活对象按 id 升序
+//     重排到表前段（old→new 重映射），重写边表/根表；回收槽压缩。
+// 并发模型：独立 GC 锁 g_gc_cs；后台回收器（bg_step）做 minor + 与 worker 真并发；
+// major 显式调用（ctx_gc_major / gc_collect_sync）。sweep 仅无任务窗口。
+// 写屏障（Dijkstra 不变量）：set_ref 黑→白 置灰压栈；老→新 记 remembered set。
+// 整理后对象 id 变化（remapped() 可查）；调用方以计数/新 id 使用。
 
 import "../../core/mnn/tl_sync.tie"
 
 const TG_WHITE: i64 = 0
 const TG_GRAY: i64 = 1
 const TG_BLACK: i64 = 2
+const TG_AGE_T: i64 = 2    // 晋升阈值：存活 minor 轮 ≥2 → 老年代
 
-var g_gc_cs: i64 = 0          // GC 锁（CRITICAL_SECTION 缓冲地址）
+var g_gc_cs: i64 = 0
 var g_gc_init: i64 = 0
 
-var g_o_size: table<i64>      // 对象字节大小
-var g_o_alive: table<i64>     // 0/1 槽位占用
-var g_o_color: table<i64>     // 三色
-var g_e_from: table<i64>
-var g_e_to: table<i64>
-var g_e_alive: table<i64>
-var g_c_roots: table<i64>
-var g_stack: table<i64>       // 灰度标记栈
-var g_sp: i64 = 0             // 栈顶游标
+var g_o_size: table<i64> = []
+var g_o_alive: table<i64> = []
+var g_o_color: table<i64> = []
+var g_o_age: table<i64> = []        // 0..T-1 新生代；≥T 老年代
+var g_e_from: table<i64> = []
+var g_e_to: table<i64> = []
+var g_e_alive: table<i64> = []
+var g_c_roots: table<i64> = []
+var g_c_rs: table<i64> = []         // remembered set（老→新 目标）
+var g_stack: table<i64> = []
+var g_sp: i64 = 0
+var g_remap: table<i64> = []        // 最近一次 major 整理的 old→new 映射（-1=已回收）
 
 // 累计统计（跨轮，探针断言）
-var g_steps_total: i64 = 0    // 标记推进步数
-var g_freed_total: i64 = 0    // 已回收对象总数
-var g_sweep_rounds: i64 = 0   // 已完成回收轮数
-var g_gc_cycle: i64 = 0       // 后台轮次状态：0=未开始 1=标记中 2=已 sweep
+var g_steps_total: i64 = 0
+var g_freed_total: i64 = 0     // major 累计回收
+var g_minor_total: i64 = 0     // minor 累计回收（young）
+var g_minor_runs: i64 = 0
+var g_major_runs: i64 = 0
+var g_compacted: i64 = 0       // 整理搬移存活对象数
+var g_sweep_rounds: i64 = 0
+var g_gc_cycle: i64 = 0
 
 namespace trm_lite_tgc {
+
+// 标记队列辅助（BFS 语义）：g_stack 只追加（tie 无尾部删除），g_sp = 队头游标；
+// 空 = 游标越界。push 到尾部、peek/前进从队头取——每个元素恰好取一次，
+// 避免「pop g_stack[g_sp-1] 与 append 尾部错位」造成的旧元素重复取。
+func mark_reset() {
+    g_stack = table_new_i64()
+    g_sp = 0
+}
+func mark_push(x: i64) {
+    table_push(g_stack, x)
+}
+func mark_peek() -> i64 {
+    return g_stack[g_sp]
+}
+func mark_advance() {
+    g_sp = g_sp + 1
+}
+func mark_empty() -> bool {
+    return g_sp >= len(g_stack)
+}
 
 // 一次初始化（幂等）。
 pub func ensure() {
@@ -53,16 +83,18 @@ pub func ensure() {
         g_o_size = table_new_i64()
         g_o_alive = table_new_i64()
         g_o_color = table_new_i64()
+        g_o_age = table_new_i64()
         g_e_from = table_new_i64()
         g_e_to = table_new_i64()
         g_e_alive = table_new_i64()
         g_c_roots = table_new_i64()
+        g_c_rs = table_new_i64()
         g_stack = table_new_i64()
+        g_remap = table_new_i64()
         g_gc_init = 1
     }
 }
 
-// 分配登记：返回对象 id（size 记录；真实字节堆 p.6.5.4 整理后接）。
 pub func alloc(size: i64) -> i64 {
     ensure()
     var id: i64 = -1
@@ -72,14 +104,15 @@ pub func alloc(size: i64) -> i64 {
         table_push(g_o_size, size)
         table_push(g_o_alive, 1)
         table_push(g_o_color, TG_WHITE)
+        table_push(g_o_age, 0)
         tl_sync.cs_leave(g_gc_cs)
     }
     return id
 }
 
-// 建立 from → to 的引用（第 k 条槽位：删旧、增新）+ 写屏障。
-// k 为 from 发出的引用槽序号（0..ref_count-1）。
-// 写屏障：若 from 黑 且 to 白（且 to 存活）→ to 置灰压栈（黑不指向白）。
+// 建立 from → to 的引用（第 k 条槽位：删旧、增新）+ 双写屏障：
+//   1) Dijkstra：黑 → 白 置灰压栈（并发标记不漏标）
+//   2) 记忆集：老年代(from) → 新生代(to) 记入 g_c_rs（minor 种子）
 pub func set_ref(from: i64, k: i64, to: i64) {
     ensure()
     if from < 0 || from >= len(g_o_alive) {
@@ -94,7 +127,6 @@ pub func set_ref(from: i64, k: i64, to: i64) {
             tl_sync.cs_leave(g_gc_cs)
             return
         }
-        // 删 from 第 k 条活跃出边（无缩表：alive 置 0）
         var seen: i64 = 0
         var e: i64 = 0
         while e < len(g_e_from) {
@@ -106,21 +138,33 @@ pub func set_ref(from: i64, k: i64, to: i64) {
             }
             e = e + 1
         }
-        // 追加新边
         table_push(g_e_from, from)
         table_push(g_e_to, to)
         table_push(g_e_alive, 1)
-        // 写屏障：黑 → 白 校正
+        // 屏障 1：黑 → 白
         if g_o_color[from] == TG_BLACK && g_o_color[to] == TG_WHITE {
             g_o_color[to] = TG_GRAY
-            table_push(g_stack, to)
-            g_sp = g_sp + 1
+            mark_push(to)
+        }
+        // 屏障 2：老 → 新 记忆集（去重遍历，容忍表增长）
+        if g_o_age[from] >= TG_AGE_T && g_o_age[to] < TG_AGE_T && g_o_alive[to] == 1 {
+            var dup: i64 = 0
+            var ri: i64 = 0
+            while ri < len(g_c_rs) {
+                if g_c_rs[ri] == to {
+                    dup = 1
+                }
+                ri = ri + 1
+            }
+            if dup == 0 {
+                table_push(g_c_rs, to)
+            }
         }
         tl_sync.cs_leave(g_gc_cs)
     }
 }
 
-// 移除 from 的第 k 条活跃出边（删边无需屏障——不产生黑→白）。
+// 移除 from 的第 k 条活跃出边（删边无需屏障）。
 pub func drop_ref(from: i64, k: i64) {
     ensure()
     if from < 0 || from >= len(g_o_alive) {
@@ -147,10 +191,8 @@ pub func drop_ref(from: i64, k: i64) {
     }
 }
 
-// 登记回收根（保守根；去重）。
-// p.6.5.3 修正：后台 cycle 进行中（g_gc_cycle==1）新登记的根必须**置灰压栈**——
-// 否则（cycle 首个 begin 早于任务登记根时）晚到的根保持白色，收敛 sweep 会误回收。
-// 语义 = 与 set_ref 写屏障同族的「根写屏障」。
+// 登记回收根（保守根；去重）。cycle 进行中与新根 → 置灰压栈（根写屏障，
+// p.6.5.3：防晚到根 white 被 young sweep 误收）。
 pub func add_root(id: i64) {
     ensure()
     if id < 0 || id >= len(g_o_alive) {
@@ -171,8 +213,7 @@ pub func add_root(id: i64) {
         }
         if g_gc_cycle == 1 && g_o_alive[id] == 1 {
             g_o_color[id] = TG_GRAY
-            table_push(g_stack, id)
-            g_sp = g_sp + 1
+            mark_push(id)
         }
         tl_sync.cs_leave(g_gc_cs)
     }
@@ -195,7 +236,7 @@ pub func drop_root(id: i64) {
     }
 }
 
-// ---------- 观察量（探针断言） ----------
+// ---------- 观察量 ----------
 pub func obj_alive(id: i64) -> bool {
     if id < 0 || id >= len(g_o_alive) {
         return false
@@ -207,6 +248,19 @@ pub func obj_color(id: i64) -> i64 {
         return -1
     }
     return g_o_color[id]
+}
+pub func obj_age(id: i64) -> i64 {
+    if id < 0 || id >= len(g_o_age) {
+        return -1
+    }
+    return g_o_age[id]
+}
+// 最近一次 major 整理的 old→new 映射（-1 = 已回收 / 未登记）
+pub func remapped(old: i64) -> i64 {
+    if old < 0 || old >= len(g_remap) {
+        return -1
+    }
+    return g_remap[old]
 }
 pub func live_count() -> i64 {
     var n: i64 = 0
@@ -221,6 +275,19 @@ pub func live_count() -> i64 {
 }
 pub func alloc_count() -> i64 {
     return len(g_o_size)
+}
+// 全部登记根中，compact 重映射后仍存活的数量（sync collect 后 = 全存活）。
+pub func root_survivors() -> i64 {
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_c_roots) {
+        var rid = g_c_roots[i]
+        if rid >= 0 && rid < len(g_o_alive) && g_o_alive[rid] == 1 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
 }
 pub func ref_count(of: i64) -> i64 {
     var n: i64 = 0
@@ -253,6 +320,18 @@ pub func steps_total() -> i64 {
 pub func freed_total() -> i64 {
     return g_freed_total
 }
+pub func minor_freed_total() -> i64 {
+    return g_minor_total
+}
+pub func minor_runs() -> i64 {
+    return g_minor_runs
+}
+pub func major_runs() -> i64 {
+    return g_major_runs
+}
+pub func compacted_total() -> i64 {
+    return g_compacted
+}
 pub func sweep_rounds() -> i64 {
     return g_sweep_rounds
 }
@@ -260,7 +339,7 @@ pub func mark_done_view() -> i64 {
     unsafe {
         tl_sync.cs_enter(g_gc_cs)
         var done: i64 = 0
-        if g_sp == 0 {
+        if mark_empty() {
             done = 1
         }
         tl_sync.cs_leave(g_gc_cs)
@@ -268,15 +347,17 @@ pub func mark_done_view() -> i64 {
     }
 }
 
-// ---------- 标记内核（调用方须已持锁，或经批处理包装） ----------
-// 标记一步：弹灰 → 自身变黑 → 扫出边把白目标置灰压栈。
-// 返回：本次推进标记的对象数。
+// ---------- 标记内核（调用方须已持锁） ----------
+// 标记栈：g_stack 为 table（append 语义，历史元素不删除），g_sp = 栈尾索引
+// （空栈 = -1）。push 后索引 = len-1；pop 读 g_stack[g_sp] 并递减。
+// （曾用 g_sp 做元素计数 + g_stack[g_sp-1] pop：table append 后新旧元素错位，
+//   重复 pop 到旧根，多级对象停留 gray 不标黑——p.6.5.3 直连形态误通过。）
 func step_locked() -> i64 {
-    if g_sp <= 0 {
+    if mark_empty() {
         return 0
     }
-    var cur = g_stack[g_sp - 1]
-    g_sp = g_sp - 1
+    var cur = mark_peek()
+    mark_advance()
     g_o_color[cur] = TG_BLACK
     var e: i64 = 0
     while e < len(g_e_from) {
@@ -284,8 +365,7 @@ func step_locked() -> i64 {
             var tgt = g_e_to[e]
             if tgt >= 0 && tgt < len(g_o_alive) && g_o_alive[tgt] == 1 && g_o_color[tgt] == TG_WHITE {
                 g_o_color[tgt] = TG_GRAY
-                table_push(g_stack, tgt)
-                g_sp = g_sp + 1
+                mark_push(tgt)
             }
         }
         e = e + 1
@@ -293,27 +373,183 @@ func step_locked() -> i64 {
     return 1
 }
 
-// 批处理标记：至多推进 n 步（或灰栈空）。返回实际推进数。
-// 供后台回收器线程与 worker（写屏障）真并发执行；持锁 ≤ 批时长。
-pub func run_batch(n: i64) -> i64 {
-    ensure()
-    var d: i64 = 0
-    unsafe {
-        tl_sync.cs_enter(g_gc_cs)
-        var i: i64 = 0
-        while i < n && g_sp > 0 {
-            var s = step_locked()
-            d = d + s
-            i = i + 1
+// 半代（minor）起始：young 全白 + 老年代置黑；种子 = 全部根 + 记忆集。
+// 调用方已持锁。
+func minor_begin_locked() {
+    var i: i64 = 0
+    while i < len(g_o_color) {
+        if g_o_alive[i] == 1 {
+            if g_o_age[i] < TG_AGE_T {
+                g_o_color[i] = TG_WHITE
+            } else {
+                g_o_color[i] = TG_BLACK  // 老年代视为已标
+            }
         }
-        g_steps_total = g_steps_total + d
-        tl_sync.cs_leave(g_gc_cs)
+        i = i + 1
     }
-    return d
+    mark_reset()
+    i = 0
+    while i < len(g_c_roots) {
+        var rid = g_c_roots[i]
+        if rid >= 0 && rid < len(g_o_alive) && g_o_alive[rid] == 1 {
+            g_o_color[rid] = TG_GRAY
+            mark_push(rid)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < len(g_c_rs) {
+        var sid = g_c_rs[i]
+        if sid >= 0 && sid < len(g_o_alive) && g_o_alive[sid] == 1 && g_o_color[sid] == TG_WHITE {
+            g_o_color[sid] = TG_GRAY
+            mark_push(sid)
+        }
+        i = i + 1
+    }
 }
 
-// 同步完整收集（无并发窗口用）：置根灰 → 标到收敛 → 回收白。
-// 返回本轮 freed。颜色全重置为白起始。
+// minor sweep：回收 young 白；存活 young age++（达阈值晋升老年代）。调用方持锁。
+// 晋升屏障：刚晋升对象的历史老→新 出边此刻才成立（写时 from 尚 young，未入 rs），
+// 补记 remembered set，保证下轮 minor 的 rs 种子覆盖新老→新 引用。
+func minor_sweep_locked() -> i64 {
+    var freed: i64 = 0
+    var i: i64 = 0
+    while i < len(g_o_alive) {
+        if g_o_alive[i] == 1 && g_o_age[i] < TG_AGE_T {
+            if g_o_color[i] == TG_WHITE {
+                g_o_alive[i] = 0
+                freed = freed + 1
+            } else {
+                g_o_age[i] = g_o_age[i] + 1   // 存活 young 晋升计数
+            }
+        }
+        i = i + 1
+    }
+    // 晋升屏障：全部 edges 里 存活 老→新 出边补进 rs（覆盖晋升历史边；幂等去重）
+    var e: i64 = 0
+    while e < len(g_e_from) {
+        var f = g_e_from[e]
+        var t = g_e_to[e]
+        if g_e_alive[e] == 1 && f >= 0 && f < len(g_o_alive) && t >= 0 && t < len(g_o_alive) {
+            if g_o_alive[f] == 1 && g_o_alive[t] == 1 && g_o_age[f] >= TG_AGE_T && g_o_age[t] < TG_AGE_T {
+                var dup: i64 = 0
+                var ri: i64 = 0
+                while ri < len(g_c_rs) {
+                    if g_c_rs[ri] == t {
+                        dup = 1
+                    }
+                    ri = ri + 1
+                }
+                if dup == 0 {
+                    table_push(g_c_rs, t)
+                }
+            }
+        }
+        e = e + 1
+    }
+    g_minor_runs = g_minor_runs + 1
+    return freed
+}
+
+// 同步 minor 收集（无并发窗口用）。返回本轮 young freed。
+// rs 持久累积不清空：撤离「两轮之间写屏障记录的旧→新 条目」被清空抹掉；
+// 陈旧条目由种子时 alive/WHITE 守卫过滤，保持正确性。
+pub func gc_minor_sync() -> i64 {
+    ensure()
+    var freed: i64 = -1
+    unsafe {
+        tl_sync.cs_enter(g_gc_cs)
+        minor_begin_locked()
+        while !mark_empty() {
+            step_locked()
+        }
+        freed = minor_sweep_locked()
+        g_minor_total = g_minor_total + freed
+        g_sweep_rounds = g_sweep_rounds + 1
+        tl_sync.cs_leave(g_gc_cs)
+    }
+    return freed
+}
+
+// mark-compact：重排存活对象到前段，old→new 映射，重写边/根。调用方持锁。
+// 前提：color 已标记（黑=存活）。返回整理搬移存活数。
+func compact_locked() -> i64 {
+    var n = len(g_o_size)
+    // 1) old→new 映射（存活黑对象按 id 升序）
+    var newid: i64 = 0
+    var i: i64 = 0
+    var rm: table<i64> = table_new_i64()
+    while i < n {
+        if g_o_alive[i] == 1 && g_o_color[i] == TG_BLACK {
+            table_push(rm, newid)
+            newid = newid + 1
+        } else {
+            table_push(rm, -1)
+        }
+        i = i + 1
+    }
+    // 2) 重排对象表（size/alive/color/age）
+    var ns: table<i64> = table_new_i64()
+    var na: table<i64> = table_new_i64()
+    var nc: table<i64> = table_new_i64()
+    var ng: table<i64> = table_new_i64()
+    i = 0
+    while i < n {
+        var r = rm[i]
+        if r >= 0 {
+            table_push(ns, g_o_size[i])
+            table_push(na, 1)
+            table_push(nc, TG_BLACK)
+            table_push(ng, g_o_age[i])
+        }
+        i = i + 1
+    }
+    // 3) 边压缩重写
+    var nfrom: table<i64> = table_new_i64()
+    var nto: table<i64> = table_new_i64()
+    var nalive: table<i64> = table_new_i64()
+    var e: i64 = 0
+    while e < len(g_e_from) {
+        if g_e_alive[e] == 1 {
+            var f = rm[g_e_from[e]]
+            var t = rm[g_e_to[e]]
+            if f >= 0 && t >= 0 {
+                table_push(nfrom, f)
+                table_push(nto, t)
+                table_push(nalive, 1)
+            }
+        }
+        e = e + 1
+    }
+    // 4) 根重写
+    var nr: table<i64> = table_new_i64()
+    var ri: i64 = 0
+    while ri < len(g_c_roots) {
+        var rr = rm[g_c_roots[ri]]
+        if rr >= 0 {
+            table_push(nr, rr)
+        }
+        ri = ri + 1
+    }
+    // 5) 生效 + 记录
+    g_remap = rm
+    g_o_size = ns
+    g_o_alive = na
+    g_o_color = nc
+    g_o_age = ng
+    g_e_from = nfrom
+    g_e_to = nto
+    g_e_alive = nalive
+    g_c_roots = nr
+    var nt2 = table_new_i64()
+    g_c_rs = nt2
+    mark_reset()
+    g_compacted = g_compacted + newid
+    return newid
+}
+
+// 同步 major 收集（全量三色 + mark-compact 整理）。返回本轮 freed。
+// 组织后对象 id 变化：remapped(old) 查询映射；调用方按新 id 使用。
 pub func gc_collect_sync() -> i64 {
     ensure()
     var freed: i64 = -1
@@ -324,18 +560,17 @@ pub func gc_collect_sync() -> i64 {
             g_o_color[i] = TG_WHITE
             i = i + 1
         }
-        g_sp = 0
+        mark_reset()
         i = 0
         while i < len(g_c_roots) {
             var rid = g_c_roots[i]
             if rid >= 0 && rid < len(g_o_alive) && g_o_alive[rid] == 1 {
                 g_o_color[rid] = TG_GRAY
-                table_push(g_stack, rid)
-                g_sp = g_sp + 1
+                mark_push(rid)
             }
             i = i + 1
         }
-        while g_sp > 0 {
+        while !mark_empty() {
             step_locked()
         }
         freed = 0
@@ -348,71 +583,38 @@ pub func gc_collect_sync() -> i64 {
             i = i + 1
         }
         g_freed_total = g_freed_total + freed
+        g_major_runs = g_major_runs + 1
         g_sweep_rounds = g_sweep_rounds + 1
+        // mark-compact：重排存活到前段
+        compact_locked()
         tl_sync.cs_leave(g_gc_cs)
     }
     return freed
 }
 
-// 后台轮次状态机（供 sched_ws 回收器线程反复调用）：
-//   1. 轮次未开始（cyc!=1）→ 重置全白 + 根置灰压栈（新轮起始）
-//   2. 推进至多 batch 步标记（与 worker 写屏障并发）
-//   3. idle（无任务窗口）且灰栈空 → sweep 白对象 → 全白重置 → cyc=2
-// 返回 1 当本轮 sweep 已完成（调用方可据 idle 决定退出）；否则 0。
-// 正确性：sweep 仅发生在 idle（pending==0 && active==0，无写屏障窗口）；
-// 写屏障（黑→白 置灰）保证不变量「黑不指向白」，并发标记不漏标。
+// 后台轮次状态机（供 sched_ws 回收器线程反复调用）：做 **minor**（young 回收），
+// 与 worker 真并发推进标记；sweep 仅无任务窗口。major 由调用方显式触发。
+// 返回 1 当本轮 minor sweep 已完成；否则 0。
 pub func bg_step(batch: i64, idle: i64) -> i64 {
     ensure()
     var finished: i64 = 0
     unsafe {
         tl_sync.cs_enter(g_gc_cs)
-        // 轮次起始（首调或 sweep 后重开）
         if g_gc_cycle != 1 {
-            var i: i64 = 0
-            while i < len(g_o_color) {
-                g_o_color[i] = TG_WHITE
-                i = i + 1
-            }
-            g_sp = 0
-            var ri: i64 = 0
-            while ri < len(g_c_roots) {
-                var rid = g_c_roots[ri]
-                if rid >= 0 && rid < len(g_o_alive) && g_o_alive[rid] == 1 {
-                    g_o_color[rid] = TG_GRAY
-                    table_push(g_stack, rid)
-                    g_sp = g_sp + 1
-                }
-                ri = ri + 1
-            }
+            // rs 持久累积（不清空）：两轮之间的写屏障条目保留；陈旧由种子守卫过滤
+            minor_begin_locked()
             g_gc_cycle = 1
         }
-        // 标记推进
         var i: i64 = 0
-        while i < batch && g_sp > 0 {
+        while i < batch && !mark_empty() {
             step_locked()
             i = i + 1
         }
         g_steps_total = g_steps_total + i
-        // 收敛 + sweep（仅 idle 窗口）
-        if g_sp == 0 && idle == 1 && g_gc_cycle == 1 {
-            var freed: i64 = 0
-            var j: i64 = 0
-            while j < len(g_o_alive) {
-                if g_o_alive[j] == 1 && g_o_color[j] == TG_WHITE {
-                    g_o_alive[j] = 0
-                    freed = freed + 1
-                }
-                j = j + 1
-            }
-            g_freed_total = g_freed_total + freed
+        if mark_empty() && idle == 1 && g_gc_cycle == 1 {
+            var freed = minor_sweep_locked()
+            g_minor_total = g_minor_total + freed
             g_sweep_rounds = g_sweep_rounds + 1
-            // 全白重置，下一轮起始
-            var k: i64 = 0
-            while k < len(g_o_color) {
-                g_o_color[k] = TG_WHITE
-                k = k + 1
-            }
-            g_sp = 0
             g_gc_cycle = 2
             finished = 1
         }

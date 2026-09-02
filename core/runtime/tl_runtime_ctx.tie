@@ -48,9 +48,10 @@ pub func ctx_drain() -> i64 {
 }
 
 // 回收：并发三色 GC 已回收对象总数（跨轮累计，p.6.5.3）。
-// 后台回收器随 drain 与 worker 真并发推进；sweep 在无任务窗口执行。
+// minor（后台/同步）与 major 回收都计入——后台回收器随 drain 与 worker 真并发
+// 推进；sweep 在无任务窗口执行。
 pub func ctx_collect() -> i64 {
-    return trm_lite_tgc.freed_total()
+    return trm_lite_tgc.freed_total() + trm_lite_tgc.minor_freed_total()
 }
 
 // GC 观察量（探针断言）
@@ -62,6 +63,36 @@ pub func ctx_gc_steps() -> i64 {
 }
 pub func ctx_gc_rounds() -> i64 {
     return trm_lite_tgc.sweep_rounds()
+}
+// p.6.5.4 分代观察量
+pub func ctx_minor_runs() -> i64 {
+    return trm_lite_tgc.minor_runs()
+}
+pub func ctx_major_runs() -> i64 {
+    return trm_lite_tgc.major_runs()
+}
+pub func ctx_minor_freed() -> i64 {
+    return trm_lite_tgc.minor_freed_total()
+}
+pub func ctx_compacted() -> i64 {
+    return trm_lite_tgc.compacted_total()
+}
+// 触发同步 minor / major（探针直控代际回收）
+pub func ctx_gc_minor() -> i64 {
+    return trm_lite_tgc.gc_minor_sync()
+}
+pub func ctx_gc_major() -> i64 {
+    return trm_lite_tgc.gc_collect_sync()
+}
+// 最近一次 major 整理的 old→new 映射（-1=已回收）
+pub func ctx_remapped(old: i64) -> i64 {
+    return trm_lite_tgc.remapped(old)
+}
+pub func ctx_obj_alive(id: i64) -> bool {
+    return trm_lite_tgc.obj_alive(id)
+}
+pub func ctx_obj_age(id: i64) -> i64 {
+    return trm_lite_tgc.obj_age(id)
 }
 
 // 观察量（验收断言）

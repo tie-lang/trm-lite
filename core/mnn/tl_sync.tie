@@ -21,36 +21,58 @@ unsafe extern fn Sleep(ms: i64) -> i64
 namespace tl_sync {
 
 pub func cs_init(cs: i64) {
-    unsafe { InitializeCriticalSection(cs) }
+    unsafe {
+        InitializeCriticalSection(cs);
+    }
 }
 pub func cs_del(cs: i64) {
-    unsafe { DeleteCriticalSection(cs) }
+    unsafe {
+        DeleteCriticalSection(cs);
+    }
 }
 pub func cs_enter(cs: i64) {
-    unsafe { EnterCriticalSection(cs) }
+    unsafe {
+        EnterCriticalSection(cs);
+    }
 }
 pub func cs_leave(cs: i64) {
-    unsafe { LeaveCriticalSection(cs) }
+    unsafe {
+        LeaveCriticalSection(cs);
+    }
 }
 pub func cv_init(cv: i64) {
-    unsafe { InitializeConditionVariable(cv) }
+    unsafe {
+        InitializeConditionVariable(cv);
+    }
 }
 pub func cv_wake(cv: i64) {
-    unsafe { WakeConditionVariable(cv) }
+    unsafe {
+        WakeConditionVariable(cv);
+    }
 }
 pub func cv_wait(cv: i64, cs: i64, ms: i64) -> i64 {
-    unsafe { return SleepConditionVariableCS(cv, cs, ms) }
+    unsafe {
+        return SleepConditionVariableCS(cv, cs, ms);
+    }
 }
 pub func thr_create(sec: i64, stack: i64, start: string, arg: i64, flags: i64, tid: i64) -> i64 {
-    unsafe { return CreateThread(sec, stack, start, arg, flags, tid) }
+    unsafe {
+        return CreateThread(sec, stack, start, arg, flags, tid);
+    }
 }
 pub func thr_wait(h: i64, ms: i64) -> i64 {
-    unsafe { return WaitForSingleObject(h, ms) }
+    unsafe {
+        return WaitForSingleObject(h, ms);
+    }
 }
 pub func thr_close(h: i64) -> i64 {
-    unsafe { return CloseHandle(h) }
+    unsafe {
+        return CloseHandle(h);
+    }
 }
 pub func sleep(ms: i64) {
-    unsafe { Sleep(ms) }
+    unsafe {
+        Sleep(ms);
+    }
 }
 }

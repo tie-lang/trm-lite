@@ -21,10 +21,10 @@ var g_cv: i64 = 0             // 全局 CONDITION_VARIABLE 缓冲地址
 var g_state_init: i64 = 0
 
 var g_regs: table<fn() -> i64> = []   // 任务注册表（regid = 下标；跨轮存活）
-var g_items: table<i64>               // 每 worker deque 段（P×SEG_CAP 预分配）
-var g_h: table<i64>
-var g_t: table<i64>
-var g_ovf: table<i64>
+var g_items: table<i64> = []          // 每 worker deque 段（P×SEG_CAP 预分配）
+var g_h: table<i64> = []
+var g_t: table<i64> = []
+var g_ovf: table<i64> = []
 var g_ovf_head: i64 = 0
 var g_spi: i64 = 0
 
@@ -32,7 +32,7 @@ var g_pending: i64 = 0
 var g_active: i64 = 0
 var g_done: i64 = 0
 var g_stolen: i64 = 0
-var g_ths: table<i64>                 // worker 线程句柄表
+var g_ths: table<i64> = []            // worker 线程句柄表
 var g_gc_th: i64 = 0                  // 后台回收器线程句柄
 
 namespace trm_lite_ws {
