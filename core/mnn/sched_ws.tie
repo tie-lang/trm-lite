@@ -1,15 +1,22 @@
 type tie<class>
-// core/mnn/sched_ws.tie —— trm-lite 复杂形态 work-stealing 调度器（p.6.5.2 多线程 / p.6.5.3 并入后台回收器）
+// core/mnn/sched_ws.tie —— trm-lite 复杂形态 work-stealing 调度器（p.6.5.2 多线程 / p.6.5.3 并入后台回收器 / p.6.5.5 可迁移栈）
 // 多 OS 线程池 + 每线程双端队列 + 任务窃取 + M:N 承托 + **并发三色 GC 后台回收器**：
 //   · 任务承载 = 注册表 g_regs（table<fn() -> i64>）+ 队列元素 regid（table<i64>）
 //   · 每线程双端队列 = g_items 预分配 P×SEG_CAP 槽（段固定不重叠）；owner 段尾
 //     LIFO 自取，他人段头 FIFO 窃取，段满溢出全局 g_ovf（p.6.5.2 定稿）
+//   · **可迁移栈（p.6.5.5）**：tie 任务为 fn() 原子执行体（无 OS 级协程栈迁移），
+//     「可迁移」语义落位为——任务与创建 worker 解耦，任意 worker 皆可执行：
+//       1) 任务执行 worker 登记 g_exec_w（spawn 时记创建者 g_orig_w）
+//       2) 迁移计数 g_migrated：worker ≠ 创建者 的执行（窃取/溢出取走）即迁移
+//       3) 运行中任务根保护：sweep 仅发生在「pending==0 && active==0」窗口，
+//          任务运行期间分配/存活对象天然受保护（GC 根 = 当前运行任务 env，
+//          降级保守根精度损失见设计 §6/§9）
 //   · 线程池按轮创建/回收（worker×P + GC×1）；同步 primitives 悉数经 tl_sync 宿主
 //     （tie extern 声明按文件作用域且跨文件不可重名——单一声明源）
 //   · 后台回收器：GC 线程与 worker 真并发推进三色标记（trm_lite_tgc.bg_step）；
 //     收敛发生在「无可取 && pending==0 && active==0」窗口（无写屏障 ⇒ sweep 安全）
 //   · 终止协议（p.6.5.2）：worker 仅当全部完成退出；pending/active 同锁原子视图
-//   · 抢占：任务为 fn() 原子执行体不可中断；时间片硬抢占待 p.6.5.5 可迁移栈
+//   · 抢占：任务为 fn() 原子执行体不可中断；时间片硬抢占待语言级中断支持
 import "../../core/mnn/tl_sync.tie"
 import "../../core/gc/gc_tri.tie"
 
@@ -21,6 +28,8 @@ var g_cv: i64 = 0             // 全局 CONDITION_VARIABLE 缓冲地址
 var g_state_init: i64 = 0
 
 var g_regs: table<fn() -> i64> = []   // 任务注册表（regid = 下标；跨轮存活）
+var g_orig_w: table<i64> = []         // 每任务创建 worker（p.6.5.5 迁移判定）
+var g_exec_w: table<i64> = []         // 每任务执行 worker（p.6.5.5 可迁移登记）
 var g_items: table<i64> = []          // 每 worker deque 段（P×SEG_CAP 预分配）
 var g_h: table<i64> = []
 var g_t: table<i64> = []
@@ -32,6 +41,7 @@ var g_pending: i64 = 0
 var g_active: i64 = 0
 var g_done: i64 = 0
 var g_stolen: i64 = 0
+var g_migrated: i64 = 0               // 迁移计数（p.6.5.5：worker≠创建者的执行次数）
 var g_ths: table<i64> = []            // worker 线程句柄表
 var g_gc_th: i64 = 0                  // 后台回收器线程句柄
 
@@ -124,6 +134,8 @@ pub func spawn(f: fn() -> i64) -> i64 {
     var regid: i64 = len(g_regs)
     table_push(g_regs, f)
     var w = g_spi % g_workers
+    table_push(g_orig_w, w)         // 创建 worker（p.6.5.5 迁移判定基准）
+    table_push(g_exec_w, -1)        // 执行 worker 未定
     if g_t[w] < WS_SEG_CAP {
         g_items[w * WS_SEG_CAP + g_t[w]] = regid
         g_t[w] = g_t[w] + 1
@@ -180,6 +192,12 @@ func worker_main(arg: i64) -> i64 {
         }
         if got == 1 {
             g_active = g_active + 1
+            // p.6.5.5 可迁移栈：登记执行 worker；worker≠创建者 → 迁移计数。
+            // 自取/窃取/溢出在此统一收敛（got 时即已决定取自何处）。
+            g_exec_w[regid] = me
+            if g_orig_w[regid] != me {
+                g_migrated = g_migrated + 1
+            }
         }
         tl_sync.cs_leave(g_cs)
         if got == 1 {
@@ -305,6 +323,21 @@ pub func stolen_count() -> i64 {
     var s = g_stolen
     tl_sync.cs_leave(g_cs)
     return s
+}
+// 迁移计数（p.6.5.5：worker≠创建者的执行次数，跨轮累计）
+pub func migrated_count() -> i64 {
+    tl_sync.cs_enter(g_cs)
+    var m = g_migrated
+    tl_sync.cs_leave(g_cs)
+    return m
+}
+// 任务执行 worker 分布：统计每 worker 实际执行了多少任务（跨轮累计核验
+// 「任务任意 worker 执行」，无需线程内自标记）。
+pub func exec_worker(id: i64) -> i64 {
+    if id < 0 || id >= len(g_exec_w) {
+        return -1
+    }
+    return g_exec_w[id]
 }
 // 运行时全局清理（进程收尾）。
 pub func shutdown() {

@@ -102,6 +102,13 @@ pub func ctx_stolen() -> i64 {
 pub func ctx_completed() -> i64 {
     return trm_lite_ws.completed_count()
 }
+// p.6.5.5 可迁移栈观察量：迁移计数 + 任务注册表执行 worker（id=regid）
+pub func ctx_migrated() -> i64 {
+    return trm_lite_ws.migrated_count()
+}
+pub func ctx_task_exec_w(id: i64) -> i64 {
+    return trm_lite_ws.exec_worker(id)
+}
 // 进程收尾清理（探针退出前调用）
 pub func ctx_shutdown() {
     trm_lite_ws.shutdown()
