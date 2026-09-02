@@ -82,11 +82,19 @@ func main() {
 复杂形态语言层入口（`namespace tl_runtime_ctx`）：
 
 - `ctx_ensure()`：复杂运行时惰性初始化（幂等）
-- `ctx_spawn(f: fn() -> i64) -> i64`：入队函数值执行体，返回任务 id（当前协作 FIFO；p.6.5.2 升级 work-stealing）
-- `ctx_queued() -> i64`：就绪任务数
-- `ctx_drain() -> i64`：协作式排空（依序执行全部就绪任务）
+- `ctx_set_workers(p)` / `ctx_workers()`：调度池大小（默认 4，须在首个 drain 前设置）
+- `ctx_spawn(f: fn() -> i64) -> i64`：注册并入队函数值执行体，返回任务 id（p.6.5.2 起
+  多线程 work-stealing 承托：每 worker 独立双端队列 + 窃取 + 溢出队列）
+- `ctx_queued() -> i64`：未完成任务数（排队 + 运行中）
+- `ctx_drain() -> i64`：并行 run——起 P 个 worker（kernel32 真线程）并发执行全部
+  就绪任务（含任务内再 spawn 的子任务），全部完成后回收池；返回本轮执行数
 - `ctx_collect() -> i64`：本轮回收对象数（占位恒 0，p.6.5.3 并发三色接管）
+- `ctx_stolen() -> i64` / `ctx_completed() -> i64`：跨轮累计窃取/完成任务数（验收观察量）
 - `ctx_version() -> string`
+
+限制（文档明示）：任务为 `fn() -> i64` 原子执行体，运行中不可被抢占；
+抢占体现为调度级（任务边界让出 + 窃取均衡），时间片硬抢占待 p.6.5.5 可迁移栈。
+跨任务可见状态请用全局/独立槽位（局部捕获是 env 副本）。
 
 验收载体：`tests/s65_ctx/ctx_shell_demo.tie`（正向 exit 0）；`tie-main/tests/_p651_probe/ctx_mix_neg.tie`（复杂 import + 内置 spawn → 编译期报错）。
 

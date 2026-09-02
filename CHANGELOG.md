@@ -2,6 +2,22 @@
 
 ## preview.2 — 2026-09-02
 
+- **p.6.5.2 work-stealing 调度器**（复杂形态执行层：协作 FIFO → 真实多线程）：
+  - 每线程双端队列：任务注册表 `g_regs`（table<fn() -> i64>，regid）+ 承载表
+    `g_items`（P×SEG_CAP 预分配，段固定不重叠）——owner 段尾 LIFO 自取、他人
+    段头 FIFO 窃取、段满溢出全局 `g_ovf`。
+  - 多 OS 线程池：每轮 drain 经 CreateThread 起 P worker、完成后 join 回收；
+    锁外执行 `g_regs[regid]()`；单 CRITICAL_SECTION + CONDITION_VARIABLE（50ms
+    轮询兜底）；终止协议「无可取 && pending==0 && active==0」原子一致无竞态。
+  - 抢占：任务为 fn() 原子执行体不可中断，抢占体现为调度级；时间片硬抢占待
+    p.6.5.5 可迁移栈（文档明示）。
+  - 已知限制：tie 标量全局变量初值被静默丢弃（`= 4` 实际 0，表全局 `= []` 却
+    生效）——sched_ws 在 ensure_state 强制默认池大小规避 `% 0`；`to_string`
+    (bool) 输出 -1 待查。
+  - 验收：`tie-main/tests/_p651_probe/ctx_ws_demo.tie`（P=4 执行线程去重=4、
+    结果全对、子任务 16、burst 1300 溢出窃取 stolen>0、并行快于串行，PASS
+    exit 0）；回归 ctx_shell_demo / spawn_demo / actor 零回归。
+
 - **p.6.5.1 复杂形态静态链接外壳**（«Go 式静态内置 runtime»复杂形态骨架——import 即选择）：
   - 独立命名空间三件骨架（与简单形态 trm_lite_sched/trm_lite_gc 物理隔离，避免与
     trm_lite.a 符号重复）：`core/mnn/sched_ws.tie`（`trm_lite_ws` 函数值任务协作

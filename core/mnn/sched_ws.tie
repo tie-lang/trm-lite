@@ -1,61 +1,332 @@
 type tie<class>
-// core/mnn/sched_ws.tie —— trm-lite 复杂形态调度器（p.6.5.2 起升级为 work-stealing）
-// p.6.5.1 复杂形态静态链接外壳：独立命名空间 trm_lite_ws 的协作任务队列占位——
-// 函数值任务（fn() -> i64）先进先出，drain 依序执行；语义与简单形态
-//（trm_lite_sched）一致，命名空间物理隔离（避免与 trm_lite.a 符号重复）。
-// p.6.5.2 将其改造为多 OS 线程池 + 每线程双端队列 + 任务窃取 + 抢占（API 形态保留）。
-// 表全局惰性初始化（trm_lite.a 静态链接/import 内联双路径安全）。
+// core/mnn/sched_ws.tie —— trm-lite 复杂形态 work-stealing 调度器（p.6.5.2）
+// 多 OS 线程池 + 每线程双端队列 + 任务窃取 + M:N 承托：
+//   · 每轮 drain（并行 run）起 P 个 worker 线程（kernel32 CreateThread），
+//     完成后 join 回收——「线程池」按轮重建，语义简单正确；
+//     常驻池优化留待 p.6.5.8 承托 actor 时再上（避免轮次竞态）。
+//   · 任务承载 = 注册表 g_regs（table<fn() -> i64>，跨轮存活；spawn 注册后
+//     得 regid）+ 队列元素 = regid（table<i64>）。可跨线程安全：闭包 env
+//     堆分配，探针 ws_thread_fn_probe / ctx_ws_demo 实证。
+//   · 每线程双端队列 = g_items 预分配 P×SEG_CAP 个槽（ensure 时按 P 一次性
+//     填充 0，索引写可达；段 [w*CAP, w*CAP+CAP) 固定不重叠）：
+//        owner 段尾 LIFO 弹取（局部性）；他人段头 FIFO 窃取（老任务）；
+//        段满溢出到全局 g_ovf（同样以 regid 承载，共享队头游标消费）。
+//   · 同步：全部调度状态保护于一把 CRITICAL_SECTION（g_cs）；闲置等待用
+//     CONDITION_VARIABLE（SleepConditionVariableCS 50ms 轮询兜底，防丢唤）。
+//   · 终止协议：worker 仅当「无可取 && pending==0 && active==0」退出——
+//     spawn 恒在锁内 pending++，任务运行中 active>=1 才会再 spawn，
+//     三量同锁成原子视图，无最后-worker 竞态。
+//   · 抢占：任务不可被中断（fn() -> i64 原子执行体）；抢占体现为调度级
+//     （任务边界让出 + 窃取均衡 + pending 优先唤醒）；时间片硬抢占须
+//     可迁移栈（p.6.5.5）后置，文档明示。
+// 表全局惰性初始化（import 内联/独立 .a 双路径安全）。
 
-// fn 元素表须声明时初始化（惰性 `= []` 重赋值对 fn 元素有缺陷，见 p.6.5.1 记录）。
-var g_ws_tasks: table<fn() -> i64> = []  // 就绪任务队列（FIFO；队头先执行）
-var g_ws_init: i64 = 0
+const WS_SEG_CAP: i64 = 256   // 每 worker deque 段容量（task 槽）
+
+var g_workers: i64 = 4        // 池大小 P（set_workers 在首个 drain 前设置生效）
+var g_cs: i64 = 0             // 全局 CRITICAL_SECTION 缓冲地址
+var g_cv: i64 = 0             // 全局 CONDITION_VARIABLE 缓冲地址
+var g_state_init: i64 = 0     // 一次初始化标志
+
+var g_regs: table<fn() -> i64> = []  // 任务注册表（regid = 下标；跨轮存活）
+var g_items: table<i64>       // 每 worker deque 段（P×SEG_CAP，预分配）
+var g_h: table<i64>           // worker 段头（段内下标）
+var g_t: table<i64>           // worker 段尾（段内下标）
+var g_ovf: table<i64>         // 段满溢出队列（regid；append + 队头游标消费）
+var g_ovf_head: i64 = 0       // 溢出队消费游标
+var g_spi: i64 = 0            // spawn 轮转游标（分摊到各 worker 段）
+
+// 计数（锁内维护；g_done/g_stolen 跨轮累计，drain 返回本轮增量）
+var g_pending: i64 = 0
+var g_active: i64 = 0
+var g_done: i64 = 0
+var g_stolen: i64 = 0
+var g_ths: table<i64>         // worker 线程句柄表（join 回收）
+
+// kernel32 同步原语（x64；void 桥按 i64 返回声明，调用方丢弃）
+unsafe extern fn InitializeCriticalSection(cs: i64) -> i64
+unsafe extern fn DeleteCriticalSection(cs: i64) -> i64
+unsafe extern fn EnterCriticalSection(cs: i64) -> i64
+unsafe extern fn LeaveCriticalSection(cs: i64) -> i64
+unsafe extern fn InitializeConditionVariable(cv: i64) -> i64
+unsafe extern fn WakeConditionVariable(cv: i64) -> i64
+unsafe extern fn SleepConditionVariableCS(cv: i64, cs: i64, ms: i64) -> i64
+unsafe extern fn CreateThread(sec: i64, stack: i64, start: string, arg: i64, flags: i64, tid: i64) -> i64
+unsafe extern fn WaitForSingleObject(h: i64, ms: i64) -> i64
+unsafe extern fn CloseHandle(h: i64) -> i64
 
 namespace trm_lite_ws {
 
-pub func ensure() {
-    if g_ws_init == 0 {
-        g_ws_init = 1
+// 一次初始化：同步原语 + 段表（按当前 P 预算容量）+ 游标清位（幂等）。
+pub func ensure_state() {
+    // 标量全局初值在 tie 中会被静默丢弃（`var g_workers: i64 = 4` 实际为 0，
+    // 见 ginit_probe 探针）；此处强制默认池大小，杜绝 `% 0` 除零。
+    if g_workers < 1 {
+        g_workers = 4
+    }
+    if g_state_init == 0 {
+        unsafe {
+            g_cs = ptr_to_int(alloc(64))
+            g_cv = ptr_to_int(alloc(64))
+            InitializeCriticalSection(g_cs)
+            InitializeConditionVariable(g_cv)
+        }
+        g_h = table_new_i64()
+        g_t = table_new_i64()
+        g_ths = table_new_i64()
+        var i: i64 = 0
+        while i < g_workers {
+            table_push(g_h, 0)
+            table_push(g_t, 0)
+            i = i + 1
+        }
+        var cap = g_workers * WS_SEG_CAP
+        var it: table<i64> = table_new_i64()
+        i = 0
+        while i < cap {
+            table_push(it, 0)
+            i = i + 1
+        }
+        g_items = it
+        g_ovf = table_new_i64()
+        g_state_init = 1
     }
 }
 
-// 入队一个函数值执行体（协作式；p.6.5.2 替换为 work-stealing 语义）。返回任务 id。
+// 池大小（须在首个 drain 前设置；改 P 会重建段表——已在初始化后则同步重配）。
+pub func set_workers(m: i64) {
+    if m < 1 {
+        return
+    }
+    if m == g_workers {
+        return
+    }
+    g_workers = m
+    if g_state_init == 1 {
+        unsafe {
+            EnterCriticalSection(g_cs)
+            var hi: table<i64> = table_new_i64()
+            var ti: table<i64> = table_new_i64()
+            var i: i64 = 0
+            while i < g_workers {
+                table_push(hi, 0)
+                table_push(ti, 0)
+                i = i + 1
+            }
+            g_h = hi
+            g_t = ti
+            var cap = g_workers * WS_SEG_CAP
+            var it: table<i64> = table_new_i64()
+            i = 0
+            while i < cap {
+                table_push(it, 0)
+                i = i + 1
+            }
+            g_items = it
+            var of: table<i64> = table_new_i64()
+            g_ovf = of
+            g_ovf_head = 0
+            g_spi = 0
+            g_pending = 0
+            g_active = 0
+            LeaveCriticalSection(g_cs)
+        }
+    }
+}
+pub func workers() -> i64 {
+    return g_workers
+}
+
+// 入队一个函数值执行体（含捕获闭包）：注册进 g_regs，得 regid；
+// 轮转推入某 worker 段（满则溢出全局队列）。返回任务 id(regid)。
+// 任务内再 spawn 亦安全（全程持锁）。
 pub func spawn(f: fn() -> i64) -> i64 {
-    ensure()
-    table_push(g_ws_tasks, f)
-    return len(g_ws_tasks) - 1
+    ensure_state()
+    unsafe {
+        EnterCriticalSection(g_cs)
+        var regid: i64 = len(g_regs)
+        table_push(g_regs, f)
+        var w = g_spi % g_workers
+        if g_t[w] < WS_SEG_CAP {
+            g_items[w * WS_SEG_CAP + g_t[w]] = regid
+            g_t[w] = g_t[w] + 1
+        } else {
+            table_push(g_ovf, regid)
+        }
+        g_spi = g_spi + 1
+        g_pending = g_pending + 1
+        WakeConditionVariable(g_cv)
+        LeaveCriticalSection(g_cs)
+    }
+    return len(g_regs) - 1
 }
 
+// 未完成任务数（排队 + 运行中）。
 pub func queued_count() -> i64 {
-    ensure()
-    return len(g_ws_tasks)
+    ensure_state()
+    unsafe {
+        EnterCriticalSection(g_cs)
+        var p = g_pending
+        LeaveCriticalSection(g_cs)
+        return p
+    }
 }
 
-pub func task_at(i: i64) -> fn() -> i64 {
-    return g_ws_tasks[i]
+// worker 主循环：自己段尾 LIFO → 窃取他人段头 FIFO → 全局溢出队头 →
+// 闲置等待。仅当「无可取 && pending==0 && active==0」返回（本轮全部完成）。
+func worker_main(arg: i64) -> i64 {
+    var me = arg
+    var last: i64 = 0
+    while 1 {
+        var got: i64 = 0
+        var regid: i64 = 0
+        unsafe {
+            EnterCriticalSection(g_cs)
+            // 1) 本地段尾弹取（LIFO）
+            if g_t[me] > g_h[me] {
+                var pos = g_t[me] - 1
+                regid = g_items[me * WS_SEG_CAP + pos]
+                g_t[me] = pos
+                got = 1
+            }
+            // 2) 窃取：轮转其它 worker 段头（FIFO 老任务）
+            var r: i64 = 1
+            while got == 0 && r < g_workers {
+                var j = (me + r) % g_workers
+                if g_t[j] > g_h[j] {
+                    regid = g_items[j * WS_SEG_CAP + g_h[j]]
+                    g_h[j] = g_h[j] + 1
+                    g_stolen = g_stolen + 1
+                    got = 1
+                }
+                r = r + 1
+            }
+            // 3) 全局溢出队列队头
+            while got == 0 && g_ovf_head < len(g_ovf) {
+                regid = g_ovf[g_ovf_head]
+                g_ovf_head = g_ovf_head + 1
+                g_stolen = g_stolen + 1
+                got = 1
+            }
+            if got == 1 {
+                g_active = g_active + 1
+            }
+            LeaveCriticalSection(g_cs)
+        }
+        if got == 1 {
+            // 锁外执行任务（任务内可再 spawn，spawn 自己取锁）
+            last = g_regs[regid]()
+            unsafe {
+                EnterCriticalSection(g_cs)
+                g_active = g_active - 1
+                g_pending = g_pending - 1
+                g_done = g_done + 1
+                LeaveCriticalSection(g_cs)
+            }
+        } else {
+            // 无可取：全部完成即退出；否则闲置等待（50ms 轮询兜底防丢唤）
+            unsafe {
+                EnterCriticalSection(g_cs)
+                if g_pending == 0 && g_active == 0 {
+                    LeaveCriticalSection(g_cs)
+                    return last
+                }
+                var w = SleepConditionVariableCS(g_cv, g_cs, 50)
+                LeaveCriticalSection(g_cs)
+            }
+        }
+    }
 }
 
-// 移除队头（无缩表原语：并行表重建）。
-pub func dequeue() {
-    var nt: table<fn() -> i64> = []
-    var n = len(g_ws_tasks)
-    var i: i64 = 1
-    while i < n {
-        table_push(nt, g_ws_tasks[i])
+// 起 worker 池（每轮 drain 重建；句柄入 g_ths 待 join）。
+func ensure_pool() {
+    var i: i64 = 0
+    while i < g_workers {
+        var th: i64 = 0
+        unsafe {
+            th = CreateThread(0, 0, cb_ptr(worker_main), i, 0, 0)
+        }
+        table_push(g_ths, th)
         i = i + 1
     }
-    g_ws_tasks = nt
 }
 
-// 协作式排空：依序执行全部就绪任务（每任务一次跑完）。返回执行数。
-pub func drain() -> i64 {
-    ensure()
-    var n: i64 = 0
-    while queued_count() > 0 {
-        var f = task_at(0)
-        f()
-        dequeue()
-        n = n + 1
+// 回收 worker 线程句柄（任务全部完成后调用；join 均立即返回）。
+func join_pool() {
+    var i: i64 = 0
+    while i < len(g_ths) {
+        unsafe {
+            WaitForSingleObject(g_ths[i], 10000)
+            CloseHandle(g_ths[i])
+        }
+        i = i + 1
     }
-    return n
+}
+
+// 本轮状态复位（drain 收尾：无并发窗口，主线程独占）。
+// g_done/g_stolen 跨轮累计（drain 返回本轮增量，观察量取累计）；
+// g_items 段容量预分配不重建，仅段内游标归位。
+func reset_round() {
+    g_spi = 0
+    g_pending = 0
+    g_active = 0
+    var i: i64 = 0
+    while i < len(g_h) {
+        g_h[i] = 0
+        g_t[i] = 0
+        i = i + 1
+    }
+    var of: table<i64> = table_new_i64()
+    g_ovf = of
+    g_ovf_head = 0
+    var nth = table_new_i64()
+    g_ths = nth
+}
+
+// 并行 run：起 P worker 并发执行全部就绪任务（含任务内再 spawn 的子任务），
+// 全部完成后回收池。返回本轮执行任务数（增量）。
+pub func drain() -> i64 {
+    ensure_state()
+    var base = g_done
+    ensure_pool()
+    // 主线程等待全部完成（50ms 轮询兜底）
+    unsafe {
+        EnterCriticalSection(g_cs)
+        while g_pending > 0 {
+            var w = SleepConditionVariableCS(g_cv, g_cs, 50)
+        }
+        LeaveCriticalSection(g_cs)
+    }
+    join_pool()
+    var r = g_done - base
+    reset_round()
+    return r
+}
+
+// 观察量（探针/验收断言；跨轮累计）
+pub func completed_count() -> i64 {
+    unsafe {
+        EnterCriticalSection(g_cs)
+        var d = g_done
+        LeaveCriticalSection(g_cs)
+        return d
+    }
+}
+pub func stolen_count() -> i64 {
+    unsafe {
+        EnterCriticalSection(g_cs)
+        var s = g_stolen
+        LeaveCriticalSection(g_cs)
+        return s
+    }
+}
+// 运行时全局清理（进程收尾）。
+pub func shutdown() {
+    if g_state_init == 1 {
+        unsafe {
+            DeleteCriticalSection(g_cs)
+        }
+        g_state_init = 0
+    }
 }
 }
