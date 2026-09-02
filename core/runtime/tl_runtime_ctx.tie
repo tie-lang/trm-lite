@@ -14,7 +14,7 @@ import "../../core/gc/gc_tri.tie"
 namespace tl_runtime_ctx {
 
 pub func ctx_version() -> string {
-    return "0.2.0"
+    return "0.3.0"
 }
 
 // 复杂形态运行时惰性初始化（幂等）。
@@ -47,9 +47,21 @@ pub func ctx_drain() -> i64 {
     return trm_lite_ws.drain()
 }
 
-// 回收：本轮回收对象数（占位恒 0，p.6.5.3 并发三色接管）。
+// 回收：并发三色 GC 已回收对象总数（跨轮累计，p.6.5.3）。
+// 后台回收器随 drain 与 worker 真并发推进；sweep 在无任务窗口执行。
 pub func ctx_collect() -> i64 {
-    return trm_lite_tgc.collect()
+    return trm_lite_tgc.freed_total()
+}
+
+// GC 观察量（探针断言）
+pub func ctx_live_objs() -> i64 {
+    return trm_lite_tgc.live_count()
+}
+pub func ctx_gc_steps() -> i64 {
+    return trm_lite_tgc.steps_total()
+}
+pub func ctx_gc_rounds() -> i64 {
+    return trm_lite_tgc.sweep_rounds()
 }
 
 // 观察量（验收断言）

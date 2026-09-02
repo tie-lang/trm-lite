@@ -2,6 +2,18 @@
 
 ## preview.2 — 2026-09-02
 
+- **p.6.5.3 并发三色 GC**（复杂形态托管堆：登记占位 → 真并发回收）：
+  - 扁平托管对象图（对象/边/根表）+ 三色标记栈；Dijkstra 写屏障（set_ref
+    黑→白 置灰压栈）+ 根写屏障（cycle 中 add_root 置灰，防晚到根误收）；
+    后台回收器线程随 drain 与 worker 真并发推进（bg_step 轮次状态机），
+    sweep 仅在无任务窗口执行；gc_collect_sync 提供同步收集供断言。
+  - 同步原语抽宿主 `core/mnn/tl_sync.tie`（tie extern 声明按文件作用域且跨文件
+    不可重名：未声明→未定义、双声明→重复定义；集中单一声明源）。
+  - 全局命名 g_c_ 前缀规避旧 trm_lite.a 归档全局（如 g_roots）的链接期撞名。
+  - 验收：`tie-main/tests/_p651_probe/ctx_gc_demo.tie`（live=16/freed=8 精确、
+    steps=16 后台推进、黑→白 交错改写后同步收集零误回收，PASS exit 0）；
+    回归 ctx_ws_demo / ctx_shell_demo / spawn_demo 零回归。
+
 - **p.6.5.2 work-stealing 调度器**（复杂形态执行层：协作 FIFO → 真实多线程）：
   - 每线程双端队列：任务注册表 `g_regs`（table<fn() -> i64>，regid）+ 承载表
     `g_items`（P×SEG_CAP 预分配，段固定不重叠）——owner 段尾 LIFO 自取、他人

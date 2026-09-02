@@ -88,9 +88,15 @@ func main() {
 - `ctx_queued() -> i64`：未完成任务数（排队 + 运行中）
 - `ctx_drain() -> i64`：并行 run——起 P 个 worker（kernel32 真线程）并发执行全部
   就绪任务（含任务内再 spawn 的子任务），全部完成后回收池；返回本轮执行数
-- `ctx_collect() -> i64`：本轮回收对象数（占位恒 0，p.6.5.3 并发三色接管）
+- `ctx_collect() -> i64`：并发三色 GC 已回收对象总数（p.6.5.3；后台回收器随
+  drain 与 worker 真并发推进，sweep 在无任务窗口执行）
+- `ctx_live_objs()` / `ctx_gc_steps()` / `ctx_gc_rounds()`：GC 观察量（存活数 / 标记推进步数 / 回收轮数）
 - `ctx_stolen() -> i64` / `ctx_completed() -> i64`：跨轮累计窃取/完成任务数（验收观察量）
 - `ctx_version() -> string`
+
+托管堆（p.6.5.3，供 GC 探针/后续组织）：`trm_lite_tgc` 提供
+`alloc(size) -> id` / `set_ref(from,k,to)`（写屏障）/ `drop_ref` / `add_root|drop_root`（保守根）/
+`gc_collect_sync()`（同步收集，断言用）。精确栈图（p.6.5.6）前根为保守登记 + 写屏障不变量。
 
 限制（文档明示）：任务为 `fn() -> i64` 原子执行体，运行中不可被抢占；
 抢占体现为调度级（任务边界让出 + 窃取均衡），时间片硬抢占待 p.6.5.5 可迁移栈。
