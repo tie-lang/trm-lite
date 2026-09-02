@@ -1,0 +1,9 @@
+type tie<class>
+// 内置 ch_open/ch_send/ch_recv 静态链接所需的 channel 内核（p.6.5.7）切面。
+// 仅定义 trm_lite_chan$ch_* 与 tl_sync$*；tl_tbl$* 为外部声明（由既有 trm_lite.a 解析）。
+// 单独切片构建以规避聚合库 declare+define 冲突（严格 opt 拒绝同模块 declare+define）。
+import "core/chan/tl_chan.tie"
+
+namespace chan_builtin_anchor {
+// 占位：本库仅承载 tl_chan import 的内容，无自有逻辑。
+}

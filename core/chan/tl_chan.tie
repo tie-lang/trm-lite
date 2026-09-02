@@ -1,0 +1,182 @@
+type tie<class>
+// core/chan/tl_chan.tie —— trm-lite channel（mailbox）承载（p.6.5.7）
+// 语义对标 Go（简化子集，互斥 + 条件变量）：
+//   · ch_send(ch, v)：锁定入队 + 唤醒一个等待者；通道关闭 → -1；队列满 → 0
+//     （满语义 = Go 阻塞 send 的务实降级：调用方依 0 自选重试/放弃，防单线程挂死）
+//   · ch_recv(ch)：有消息 → 消息值；通道关闭且空 → -1；空未关 → 0（非阻塞降级）
+//   · ch_close(ch)：置关闭位（幂等）；清空残留等待（后续 send/recv 见关闭）
+// 承载结构（tie 只支持一维表，环形缓冲扁平化，与 sched_ws g_items 同款）：
+//   · ch 句柄 = 1 起自增（0=无效）；每通道一段 CH_CAP 深环形槽（data[(ch-1)*CAP+k]）
+//   · 平行数组：cs/cv 缓冲地址、closed 标志、head/tail 游标（0..CH_CAP 循环）
+//   · 队列满 = (tail-head)==CH_CAP；空 = head==tail
+// 线程安全：所有操作持通道锁；K32 条件变量配套唤醒（recv 空者被 send 唤醒）。
+import "../../core/mnn/tl_sync.tie"
+
+const CH_MAX: i64 = 256       // 通道数上限
+const CH_CAP: i64 = 64        // 单通道环形容量
+
+var g_ch_next: i64 = 0        // 下一个通道句柄（1 起）
+var g_ch_cs: table<i64> = []  // 每通道 CRITICAL_SECTION 缓冲地址
+var g_ch_cv: table<i64> = []  // 每通道 CONDITION_VARIABLE 缓冲地址
+var g_ch_closed: table<i64> = []
+var g_ch_head: table<i64> = []
+var g_ch_tail: table<i64> = []
+var g_ch_data: table<i64> = []        // 全部通道环形数据段
+var g_ch_init: i64 = 0
+
+namespace trm_lite_chan {
+
+// 一次初始化（幂等）。
+pub func ensure() {
+    if g_ch_init == 0 {
+        g_ch_cs = table_new_i64()
+        g_ch_cv = table_new_i64()
+        g_ch_closed = table_new_i64()
+        g_ch_head = table_new_i64()
+        g_ch_tail = table_new_i64()
+        g_ch_data = table_new_i64()
+        var i: i64 = 0
+        while i < CH_MAX * CH_CAP {
+            table_push(g_ch_data, 0)
+            i = i + 1
+        }
+        g_ch_init = 1
+    }
+}
+
+// 分配新 channel，返回句柄（1 起；达上限返回 0）。
+pub func ch_open() -> i64 {
+    ensure()
+    if g_ch_next >= CH_MAX {
+        return 0
+    }
+    var cs: i64 = 0
+    unsafe {
+        cs = ptr_to_int(alloc(64))
+        tl_sync.cs_init(cs)
+    }
+    var cv: i64 = 0
+    unsafe {
+        cv = ptr_to_int(alloc(64))
+        tl_sync.cv_init(cv)
+    }
+    g_ch_next = g_ch_next + 1
+    var ch = g_ch_next
+    table_push(g_ch_cs, cs)
+    table_push(g_ch_cv, cv)
+    table_push(g_ch_closed, 0)
+    table_push(g_ch_head, 0)
+    table_push(g_ch_tail, 0)
+    return ch
+}
+
+// 发送：返回 0=入队成功 1=失败（通道关闭或队列满）。
+pub func ch_send(ch: i64, v: i64) -> i64 {
+    ensure()
+    if ch < 1 || ch > g_ch_next {
+        return 1
+    }
+    var cs = g_ch_cs[ch - 1]
+    var cv = g_ch_cv[ch - 1]
+    var res: i64 = 0
+    unsafe {
+        tl_sync.cs_enter(cs)
+        if g_ch_closed[ch - 1] == 1 {
+            res = 1
+        } else if g_ch_tail[ch - 1] - g_ch_head[ch - 1] == CH_CAP {
+            res = 1
+        } else {
+            var k = (ch - 1) * CH_CAP + (g_ch_tail[ch - 1] % CH_CAP)
+            g_ch_data[k] = v
+            g_ch_tail[ch - 1] = g_ch_tail[ch - 1] + 1
+            tl_sync.cv_wake(cv)
+        }
+        tl_sync.cs_leave(cs)
+    }
+    return res
+}
+
+// 接收：返回消息值；0 = 空(未关)；-1 = 已关闭且空。
+pub func ch_recv(ch: i64) -> i64 {
+    ensure()
+    if ch < 1 || ch > g_ch_next {
+        return -1
+    }
+    var cs = g_ch_cs[ch - 1]
+    var cv = g_ch_cv[ch - 1]
+    var res: i64 = -1
+    var got: i64 = 0
+    unsafe {
+        tl_sync.cs_enter(cs)
+        while got == 0 {
+            if g_ch_tail[ch - 1] - g_ch_head[ch - 1] > 0 {
+                var k = (ch - 1) * CH_CAP + (g_ch_head[ch - 1] % CH_CAP)
+                res = g_ch_data[k]
+                g_ch_head[ch - 1] = g_ch_head[ch - 1] + 1
+                got = 1
+            } else if g_ch_closed[ch - 1] == 1 {
+                res = -1
+                got = 1
+            } else {
+                // 空且未关：等待唤醒（条件变量 50ms 兜底，防挂死）
+                var w = tl_sync.cv_wait(cv, cs, 50)
+                // 唤醒后回到循环顶部重试；若仍空则返回 0（非阻塞降级）
+                if w == 0 {
+                    res = 0
+                    got = 1
+                }
+            }
+        }
+        tl_sync.cs_leave(cs)
+    }
+    return res
+}
+
+// 关闭：幂等。之后 send 失败、recv 排空后返回 -1。
+pub func ch_close(ch: i64) {
+    ensure()
+    if ch < 1 || ch > g_ch_next {
+        return
+    }
+    var cs = g_ch_cs[ch - 1]
+    var cv = g_ch_cv[ch - 1]
+    unsafe {
+        tl_sync.cs_enter(cs)
+        g_ch_closed[ch - 1] = 1
+        tl_sync.cv_wake(cv)
+        tl_sync.cs_leave(cs)
+    }
+}
+
+// 观察量
+pub func ch_closed_flag(ch: i64) -> i64 {
+    if ch < 1 || ch > g_ch_next {
+        return 1
+    }
+    return g_ch_closed[ch - 1]
+}
+pub func ch_len(ch: i64) -> i64 {
+    if ch < 1 || ch > g_ch_next {
+        return 0
+    }
+    return g_ch_tail[ch - 1] - g_ch_head[ch - 1]
+}
+pub func ch_count() -> i64 {
+    return g_ch_next
+}
+
+// 运行时清理（进程收尾）。
+pub func shutdown() {
+    if g_ch_init == 1 {
+        var i: i64 = 0
+        while i < g_ch_next {
+            var cs = g_ch_cs[i]
+            unsafe {
+                tl_sync.cs_del(cs)
+            }
+            i = i + 1
+        }
+        g_ch_init = 0
+    }
+}
+}

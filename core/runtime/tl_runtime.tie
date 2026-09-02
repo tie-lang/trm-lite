@@ -11,6 +11,7 @@ type tie<class>
 import "../../core/mnn/sched.tie"
 import "../../core/gc/gc.tie"
 import "../../core/tbl/tl_tbl.tie"
+import "../../core/chan/tl_chan.tie"
 
 namespace tl_runtime {
 

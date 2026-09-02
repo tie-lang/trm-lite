@@ -10,6 +10,7 @@ type tie<class>
 // 后续切片同文件不拆 API、只换执行层实现（p.6.5.3 并发三色 / p.6.5.7 channel）。
 import "../../core/mnn/sched_ws.tie"
 import "../../core/gc/gc_tri.tie"
+import "../../core/chan/tl_chan.tie"
 
 namespace tl_runtime_ctx {
 
@@ -112,5 +113,28 @@ pub func ctx_task_exec_w(id: i64) -> i64 {
 // 进程收尾清理（探针退出前调用）
 pub func ctx_shutdown() {
     trm_lite_ws.shutdown()
+    trm_lite_chan.shutdown()
+}
+
+// ---------- channel 语言入口（p.6.5.7：mailbox 承载）----------
+// 复杂形态下 ch_* 与内置原语是替代路径：tiec 内置 ch_send/ch_recv/ch_close
+// 直接链接 trm_lite.a 同名符号；import 本库后可用 ctx_ch_open/ctx_ch_send 等。
+pub func ctx_ch_open() -> i64 {
+    return trm_lite_chan.ch_open()
+}
+pub func ctx_ch_send(ch: i64, v: i64) -> i64 {
+    return trm_lite_chan.ch_send(ch, v)
+}
+pub func ctx_ch_recv(ch: i64) -> i64 {
+    return trm_lite_chan.ch_recv(ch)
+}
+pub func ctx_ch_close(ch: i64) {
+    trm_lite_chan.ch_close(ch)
+}
+pub func ctx_ch_len(ch: i64) -> i64 {
+    return trm_lite_chan.ch_len(ch)
+}
+pub func ctx_ch_count() -> i64 {
+    return trm_lite_chan.ch_count()
 }
 }
