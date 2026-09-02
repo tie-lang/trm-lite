@@ -2,6 +2,27 @@
 
 ## preview.2 — 2026-09-02
 
+- **p.6.5.4 分代 + mark-compact 回收**（新生代/老年代 minor + 老年代整理回收）：
+  - 年龄表 `g_o_age` + 晋升阈值 `TG_AGE_T`：存活 minor 轮 ≥2 → 老年代。
+  - minor（半代）：young 全白 + 老年代预黑；种子 = 全根 + 记忆集 `g_c_rs`；
+    sweep 只回收 young 白，存活 young age++（晋升）；老垃圾对 minor 免疫。
+  - 记忆集：写屏障「老→新」入 rs（去重）+ **晋升屏障**（minor sweep 后扫描
+    全部边，存活 老→新 补入 rs——覆盖晋升对象的陈旧历史出边）；rs 持久累积
+    不清空（清空会抹掉两轮之间的屏障条目），陈旧条目由种子时 alive/WHITE 守卫。
+  - major：全量三色 + **mark-compact**——存活黑对象按 id 升序重排到表前段，
+    old→new 映射 `g_remap`，边表/根表重写，槽位压缩回收（`remapped()` 查询）。
+  - **修复标记栈缺陷**：tie `table_push` 只追加不删除；旧实现 `g_stack[g_sp-1]`
+    pop + 计数，表内新旧元素错位 → 每轮重复 pop 旧根、多级对象停留 gray（标记
+    不收敛、老垃圾逃过 sweep）。改为队列式头游标（`mark_reset/mark_push/
+    mark_peek/mark_advance/mark_empty`，BFS 遍历每个灰点恰好取一次）。
+  - ctx 观察量扩展：`ctx_minor_runs/ctx_major_runs/ctx_minor_freed/ctx_compacted/
+    ctx_gc_minor/ctx_gc_major/ctx_remapped/ctx_obj_age`；`ctx_collect` 汇总
+    minor+major 累计回收；`root_survivors()` 供探针断言 compact 后根全存活。
+  - 验收：`tie-main/tests/_p651_probe/gc_gen_demo.tie`（10 根晋升 10/10、rs 隔离
+    存活、老垃圾免疫 minor、major 回收 21 + compact 重映射边正确，PASS exit 0）；
+    既有 ctx_gc_demo（同步收断言修复：垃圾回收 >0 且 16 根全存活）与
+    ctx_ws_demo / ctx_shell_demo / spawn_demo / m6_actor 零回归。
+
 - **p.6.5.3 并发三色 GC**（复杂形态托管堆：登记占位 → 真并发回收）：
   - 扁平托管对象图（对象/边/根表）+ 三色标记栈；Dijkstra 写屏障（set_ref
     黑→白 置灰压栈）+ 根写屏障（cycle 中 add_root 置灰，防晚到根误收）；
