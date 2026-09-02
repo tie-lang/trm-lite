@@ -1,5 +1,23 @@
 # trm-lite 变更日志
 
+## preview.2 — 2026-09-02
+
+- **p.6.5.1 复杂形态静态链接外壳**（«Go 式静态内置 runtime»复杂形态骨架——import 即选择）：
+  - 独立命名空间三件骨架（与简单形态 trm_lite_sched/trm_lite_gc 物理隔离，避免与
+    trm_lite.a 符号重复）：`core/mnn/sched_ws.tie`（`trm_lite_ws` 函数值任务协作
+    FIFO 队列 `spawn/queued_count/task_at/dequeue/drain`，p.6.5.2 在此升级
+    work-stealing）、`core/gc/gc_tri.tie`（`trm_lite_tgc` 分配登记占位
+    `alloc/alloc_count/collect`，p.6.5.3 并发三色接管）、
+    `core/runtime/tl_runtime_ctx.tie`（`tl_runtime_ctx` 复杂形态汇总库，语言层入口
+    `ctx_ensure/ctx_spawn/ctx_queued/ctx_drain/ctx_collect/ctx_version`）。
+  - tiec 侧（tie-main）：内置 spawn/yield/collect 与 import trm-lite 的冲突检测扩展到
+    复杂形态汇总库（`tl_runtime_ctx::ctx_*`）——复杂 import 与内置混用编译期报错。
+  - 已知限制：全局 `table<fn() -> i64>` 惰性 `= []` 重赋值缺陷（fn 元素路径崩溃），
+    须声明时初始化；局部捕获是环境副本（跨任务可见状态须用全局，与简单形态一致）。
+  - 验收：`tests/s65_ctx/ctx_shell_demo.tie`（3 任务排队 → drain → collect，exit 0）；
+    负例 `tie-main/tests/_p651_probe/ctx_mix_neg.tie`（复杂 import + 内置 spawn → 编译期报错）；
+    简单形态 spawn_demo 零回归；tiec 二阶自举 IR 不动点一致。
+
 ## preview.1 — 2026-08-27
 
 - **阶段 1 块 2：spawn/yield/collect 成为 tiec 完整内置原语**（不依赖 import，静态链接 trm_lite.a）。

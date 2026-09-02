@@ -1,0 +1,61 @@
+type tie<class>
+// core/mnn/sched_ws.tie —— trm-lite 复杂形态调度器（p.6.5.2 起升级为 work-stealing）
+// p.6.5.1 复杂形态静态链接外壳：独立命名空间 trm_lite_ws 的协作任务队列占位——
+// 函数值任务（fn() -> i64）先进先出，drain 依序执行；语义与简单形态
+//（trm_lite_sched）一致，命名空间物理隔离（避免与 trm_lite.a 符号重复）。
+// p.6.5.2 将其改造为多 OS 线程池 + 每线程双端队列 + 任务窃取 + 抢占（API 形态保留）。
+// 表全局惰性初始化（trm_lite.a 静态链接/import 内联双路径安全）。
+
+// fn 元素表须声明时初始化（惰性 `= []` 重赋值对 fn 元素有缺陷，见 p.6.5.1 记录）。
+var g_ws_tasks: table<fn() -> i64> = []  // 就绪任务队列（FIFO；队头先执行）
+var g_ws_init: i64 = 0
+
+namespace trm_lite_ws {
+
+pub func ensure() {
+    if g_ws_init == 0 {
+        g_ws_init = 1
+    }
+}
+
+// 入队一个函数值执行体（协作式；p.6.5.2 替换为 work-stealing 语义）。返回任务 id。
+pub func spawn(f: fn() -> i64) -> i64 {
+    ensure()
+    table_push(g_ws_tasks, f)
+    return len(g_ws_tasks) - 1
+}
+
+pub func queued_count() -> i64 {
+    ensure()
+    return len(g_ws_tasks)
+}
+
+pub func task_at(i: i64) -> fn() -> i64 {
+    return g_ws_tasks[i]
+}
+
+// 移除队头（无缩表原语：并行表重建）。
+pub func dequeue() {
+    var nt: table<fn() -> i64> = []
+    var n = len(g_ws_tasks)
+    var i: i64 = 1
+    while i < n {
+        table_push(nt, g_ws_tasks[i])
+        i = i + 1
+    }
+    g_ws_tasks = nt
+}
+
+// 协作式排空：依序执行全部就绪任务（每任务一次跑完）。返回执行数。
+pub func drain() -> i64 {
+    ensure()
+    var n: i64 = 0
+    while queued_count() > 0 {
+        var f = task_at(0)
+        f()
+        dequeue()
+        n = n + 1
+    }
+    return n
+}
+}

@@ -1,0 +1,36 @@
+type tie<class>
+// core/gc/gc_tri.tie —— trm-lite 复杂形态 GC（p.6.5.3 并发三色 / p.6.5.4 分代整理）
+// p.6.5.1 复杂形态静态链接外壳：独立命名空间 trm_lite_tgc 的分配登记占位——
+// alloc 登记对象（id 即下标）、collect 返回本轮回收数（占位恒 0：真实回收
+// 语义 p.6.5.3 并发三色（标记栈/写屏障/后台回收器）+ p.6.5.4 分代/整理落地）。
+// 表全局惰性初始化（trm_lite.a 静态链接/import 内联双路径安全）。
+
+var g_tgc_init: i64 = 0
+var g_tgc_objs: table<i64>   // 对象登记（size；占位期仅登记不回收）
+
+namespace trm_lite_tgc {
+
+pub func ensure() {
+    if g_tgc_init == 0 {
+        g_tgc_objs = table_new_i64()
+        g_tgc_init = 1
+    }
+}
+
+// 分配登记：返回对象 id（占位实现；p.6.5.3 接管为真实托管堆）。
+pub func alloc(size: i64) -> i64 {
+    ensure()
+    table_push(g_tgc_objs, size)
+    return len(g_tgc_objs) - 1
+}
+
+pub func alloc_count() -> i64 {
+    ensure()
+    return len(g_tgc_objs)
+}
+
+// 本轮回收对象数（占位恒 0：并发三色 GC 未落地前无回收）。
+pub func collect() -> i64 {
+    return 0
+}
+}

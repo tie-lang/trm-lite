@@ -1,6 +1,6 @@
 # trm-lite — tie 平台的 Go 式静态内置运行时
 
-> 状态：**阶段 1 进行中**（简单形态内置原语已落地；复杂形态 runtime 库骨架已建，未实现）
+> 状态：**阶段 2 进行中**（简单形态内置原语已落地；复杂形态静态链接外壳已起，work-stealing/并发三色 GC/可迁移栈 依 p.6.5 切片推进）
 
 trm-lite 为 tie 引入 **Go 式静态内置 runtime** 形态，对标 Go 把调度器/GC 以库形式**静态链接**进单一零依赖二进制。与 trm（字节码 VM，路线 B）**并行开发、互不干扰**。
 
@@ -56,6 +56,39 @@ tiec spawn_demo.tie -o spawn_demo.exe
 - `collect() -> i64`：跑一次 mark-sweep GC，返回本轮回收对象数。
 
 验收载体：`tests/s10_exec/`（`exec_demo` 阶段 1 块 1 内核验收；`spawn_demo`/`spawn_void_demo` 块 2 内置验收）。
+
+## 快速开始（阶段 2 起：复杂形态 import 即选择）
+
+复杂形态以**独立命名空间**（`trm_lite_ws` / `trm_lite_tgc` / `tl_runtime_ctx`）静态内置，
+与简单形态内置原语互为替代路径（同程序混用 → tiec 编译期报错）。用户程序 `import`
+复杂形态汇总库即选择复杂运行时：
+
+```tie
+type tie<logic>
+import "../../trm-lite/core/runtime/tl_runtime_ctx.tie"
+
+var g_cnt: i64 = 0
+
+func main() {
+    tl_runtime_ctx.ctx_ensure()
+    tl_runtime_ctx.ctx_spawn(func() -> i64 { g_cnt = g_cnt + 1; return g_cnt })
+    tl_runtime_ctx.ctx_spawn(func() -> i64 { g_cnt = g_cnt + 2; return g_cnt })
+    tl_runtime_ctx.ctx_drain()     // 协作排空就绪任务队列
+    tl_runtime_ctx.ctx_collect()   // 回收（p.6.5.3 起真实回收）
+    println("cnt=" + to_string(g_cnt))
+}
+```
+
+复杂形态语言层入口（`namespace tl_runtime_ctx`）：
+
+- `ctx_ensure()`：复杂运行时惰性初始化（幂等）
+- `ctx_spawn(f: fn() -> i64) -> i64`：入队函数值执行体，返回任务 id（当前协作 FIFO；p.6.5.2 升级 work-stealing）
+- `ctx_queued() -> i64`：就绪任务数
+- `ctx_drain() -> i64`：协作式排空（依序执行全部就绪任务）
+- `ctx_collect() -> i64`：本轮回收对象数（占位恒 0，p.6.5.3 并发三色接管）
+- `ctx_version() -> string`
+
+验收载体：`tests/s65_ctx/ctx_shell_demo.tie`（正向 exit 0）；`tie-main/tests/_p651_probe/ctx_mix_neg.tie`（复杂 import + 内置 spawn → 编译期报错）。
 
 ## 工程结构
 

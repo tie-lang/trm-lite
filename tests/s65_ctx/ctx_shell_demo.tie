@@ -1,0 +1,29 @@
+type tie<logic>
+// tests/s65_ctx/ctx_shell_demo.tie —— p.6.5.1 复杂形态静态链接外壳验收（正向）
+// import 复杂形态汇总库（tl_runtime_ctx）→ 单一二进制内静态内置复杂 runtime。
+// ctx_spawn 入队 3 个任务（捕获闭包 + 命名函数）→ ctx_drain 协作排空 →
+// ctx_collect（占位恒 0）→ 退出码 0。
+// 捕获语义与简单形态 spawn_demo 一致：跨任务可见状态用全局（局部捕获是 env 副本）。
+// 期望输出：queued=3 / run=3 / cnt=7 / collect=0 / ctx=0.1.0 / done
+import "../../core/runtime/tl_runtime_ctx.tie"
+
+var g_cnt: i64 = 0
+
+func inc1() -> i64 {
+    g_cnt = g_cnt + 1
+    return g_cnt
+}
+
+func main() {
+    tl_runtime_ctx.ctx_ensure()
+    var t1 = tl_runtime_ctx.ctx_spawn(func() -> i64 { g_cnt = g_cnt + 3; return g_cnt })
+    var t2 = tl_runtime_ctx.ctx_spawn(func() -> i64 { g_cnt = g_cnt + 3; return g_cnt })
+    var t3 = tl_runtime_ctx.ctx_spawn(inc1)
+    println("queued=" + to_string(tl_runtime_ctx.ctx_queued()))   // queued=3
+    var ran = tl_runtime_ctx.ctx_drain()
+    println("run=" + to_string(ran))                               // run=3
+    println("cnt=" + to_string(g_cnt))                             // cnt=7（3+3+1）
+    println("collect=" + to_string(tl_runtime_ctx.ctx_collect()))  // collect=0（占位）
+    println("ctx=" + tl_runtime_ctx.ctx_version())
+    println("done")
+}
