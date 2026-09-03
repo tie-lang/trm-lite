@@ -110,6 +110,10 @@ pub func ctx_migrated() -> i64 {
 pub func ctx_task_exec_w(id: i64) -> i64 {
     return trm_lite_ws.exec_worker(id)
 }
+// p.6.7.8 常驻池观察量：线程句柄表长度（多轮 drain 恒定，不随轮数增长）
+pub func ctx_pool_threads() -> i64 {
+    return trm_lite_ws.thread_count()
+}
 // 进程收尾清理（探针退出前调用）
 pub func ctx_shutdown() {
     trm_lite_ws.shutdown()

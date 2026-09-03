@@ -2,6 +2,18 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.7.8 复杂形态常驻池（C-pool）**：
+  - `core/mnn/sched_ws.tie`：池起于首次 drain、止于 ctx_shutdown——`g_pool_up`
+    常驻标记 + `g_shutdown` 停机标记；worker 主循环「无可取 && pending==0 &&
+    active==0」不再 return（cv_wait 限时存活，新一轮 spawn cv_wake 唤醒，仅见
+    停机退出）；后台回收器改常驻循环；`drain()` 等本轮排空不 join/重建；
+    `reset_round` 不重建句柄表；`shutdown()` 置标记+广播+join 真正池销毁；
+    `set_workers` 池启后拒改（段/线程失配防护）；新增 `thread_count` 观察量
+    （tl_runtime_ctx 转发 `ctx_pool_threads`）。
+  - 验收：`c_pool_resident_probe`（3 轮 × 40 任务）ths=4 恒定、每轮 tid≥4、
+    len=120 无重复 PASS×3；p.6.7 全套 + m6_actor + ctx_ws/ctx_gc/combo/parity_chan
+    零回归。
+
 - **p.6.7.7 简单形态窃取队列（S-deque）**：
   - `core/mnn/sched.tie`：S-pool 单全局队列升级为 per-worker 双端队列——owner 段尾
     LIFO 自取、他人段头 FIFO 窃取、段满溢出全局（复刻 sched_ws 算法、独立实现不依赖

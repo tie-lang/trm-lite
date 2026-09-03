@@ -44,6 +44,8 @@ var g_stolen: i64 = 0
 var g_migrated: i64 = 0               // 迁移计数（p.6.5.5：worker≠创建者的执行次数）
 var g_ths: table<i64> = []            // worker 线程句柄表
 var g_gc_th: i64 = 0                  // 后台回收器线程句柄
+var g_pool_up: i64 = 0                // 池常驻标记（p.6.7.8：起于首次 drain、止于 shutdown）
+var g_shutdown: i64 = 0               // 停机标记（p.6.7.8：worker/GC 见 1 退出，池销毁）
 
 namespace trm_lite_ws {
 
@@ -85,7 +87,8 @@ pub func ensure_state() {
 
 // 池大小（须在首个 drain 前设置；改 P 会重建段表）。
 pub func set_workers(m: i64) {
-    if m < 1 || m == g_workers {
+    // p.6.7.8：池已常驻后禁止改 P（段表重建与实际线程数失配）。
+    if m < 1 || m == g_workers || g_pool_up == 1 {
         return
     }
     g_workers = m
@@ -159,7 +162,8 @@ pub func queued_count() -> i64 {
 }
 
 // worker 主循环：自己段尾 LIFO → 窃取他人段头 FIFO → 全局溢出队头 → 闲置等待。
-// 仅当「无可取 && pending==0 && active==0」返回（本轮全部完成）。
+// p.6.7.8：常驻池——「无可取 && pending==0 && active==0」**不再退出**，改 cv_wait
+// 限时继续存活（新一轮 spawn 经 cv_wake 唤醒）；仅 g_shutdown==1 时退出（池销毁）。
 func worker_main(arg: i64) -> i64 {
     var me = arg
     var last: i64 = 0
@@ -209,23 +213,29 @@ func worker_main(arg: i64) -> i64 {
             tl_sync.cs_leave(g_cs)
         } else {
             tl_sync.cs_enter(g_cs)
-            if g_pending == 0 && g_active == 0 {
+            if g_shutdown == 1 {
                 tl_sync.cs_leave(g_cs)
                 return last
             }
+            // 空闲：限时等待（新任务 spawn 唤醒；短路判断在醒来后于循环顶重来）
             var w = tl_sync.cv_wait(g_cv, g_cs, 50)
             tl_sync.cs_leave(g_cs)
         }
     }
 }
 
-// 后台回收器主循环（p.6.5.3）：与 worker 真并发推进三色标记；在
-// 「无任务运行」窗口收敛 sweep 后退出。绝不嵌套持有两把锁。
+// 后台回收器主循环（p.6.5.3）：与 worker 真并发推进三色标记；只有「无任务运行」
+// 窗口才做大批次，sweep 安全。p.6.7.8：常驻——一直在后台跑（含跨 drain 空闲
+// 窗口），仅 g_shutdown==1 时退出（池销毁 join）。
 func gc_worker_main(_: i64) -> i64 {
     var last: i64 = 0
     while 1 {
         var idle: i64 = 0
         tl_sync.cs_enter(g_cs)
+        if g_shutdown == 1 {
+            tl_sync.cs_leave(g_cs)
+            return last
+        }
         if g_pending == 0 && g_active == 0 {
             idle = 1
         }
@@ -235,21 +245,18 @@ func gc_worker_main(_: i64) -> i64 {
             batch = 2000000
         }
         var fin = trm_lite_tgc.bg_step(batch, idle)
-        if fin == 1 && idle == 1 {
-            // 本轮 sweep 完成且空闲保持 → 退出（drain 收尾 join）
-            tl_sync.cs_enter(g_cs)
-            if g_pending == 0 && g_active == 0 {
-                tl_sync.cs_leave(g_cs)
-                return last
-            }
-            tl_sync.cs_leave(g_cs)
-        }
         tl_sync.sleep(1)
     }
 }
 
-// 起池（每轮 drain 重建）：P worker + 1 后台回收器。
+// 起池（p.6.7.8）：**常驻**——仅首次 drain 创建 P worker + 1 后台回收器；
+// 之后 ensure_pool 幂等直通（不再每轮重建/回收）。
 func ensure_pool() {
+    if g_pool_up == 1 {
+        return
+    }
+    g_pool_up = 1
+    g_shutdown = 0
     var i: i64 = 0
     while i < g_workers {
         var th: i64 = 0
@@ -260,7 +267,7 @@ func ensure_pool() {
     g_gc_th = tl_sync.thr_create(0, 0, cb_ptr(gc_worker_main), 0, 0, 0)
 }
 
-// 回收线程句柄（任务全部完成后 join 均立即返回）。
+// 池销毁（仅 shutdown 路径）：join 全部 worker + 后台回收器（见 g_shutdown=1 退出）。
 func join_pool() {
     var i: i64 = 0
     while i < len(g_ths) {
@@ -273,10 +280,14 @@ func join_pool() {
         tl_sync.thr_close(g_gc_th)
         g_gc_th = 0
     }
+    var nth = table_new_i64()
+    g_ths = nth
+    g_pool_up = 0
 }
 
 // 本轮状态复位（drain 收尾：无并发窗口，主线程独占）。
 // g_done/g_stolen 跨轮累计（drain 返回本轮增量，观察量取累计）。
+// p.6.7.8：**不再清 g_ths**（线程句柄表是池资产，只随 join_pool 销毁）。
 func reset_round() {
     g_spi = 0
     g_pending = 0
@@ -290,12 +301,11 @@ func reset_round() {
     var of: table<i64> = table_new_i64()
     g_ovf = of
     g_ovf_head = 0
-    var nth = table_new_i64()
-    g_ths = nth
 }
 
 // 并行 run：P worker 并发执行全部任务（含任务内再 spawn）+ 后台回收器并发
-// 三色标记；全部完成后回收池。返回本轮执行任务数（增量）。
+// 三色标记。p.6.7.8：等待本轮排空后**不做池回收**（池常驻）；句柄表恒定。
+// 返回本轮执行任务数（增量）。
 pub func drain() -> i64 {
     ensure_state()
     var base = g_done
@@ -305,10 +315,14 @@ pub func drain() -> i64 {
         var w = tl_sync.cv_wait(g_cv, g_cs, 50)
     }
     tl_sync.cs_leave(g_cs)
-    join_pool()
     var r = g_done - base
     reset_round()
     return r
+}
+
+// 常驻池线程句柄表长度（p.6.7.8 观察量：多轮 drain 不增长）。
+pub func thread_count() -> i64 {
+    return len(g_ths)
 }
 
 // 观察量（跨轮累计）
@@ -339,9 +353,17 @@ pub func exec_worker(id: i64) -> i64 {
     }
     return g_exec_w[id]
 }
-// 运行时全局清理（进程收尾）。
+// 运行时全局清理（进程收尾）。p.6.7.8：真正池销毁——置停机标记 + 广播唤醒
+// （worker/GC 见 1 退出）→ join 全部线程 → 删段/锁。幂等。
 pub func shutdown() {
     if g_state_init == 1 {
+        if g_pool_up == 1 {
+            tl_sync.cs_enter(g_cs)
+            g_shutdown = 1
+            tl_sync.cv_wake(g_cv)
+            tl_sync.cs_leave(g_cs)
+            join_pool()
+        }
         tl_sync.cs_del(g_cs)
         g_state_init = 0
     }
