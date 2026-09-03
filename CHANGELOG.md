@@ -2,6 +2,20 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.7.7 简单形态窃取队列（S-deque）**：
+  - `core/mnn/sched.tie`：S-pool 单全局队列升级为 per-worker 双端队列——owner 段尾
+    LIFO 自取、他人段头 FIFO 窃取、段满溢出全局（复刻 sched_ws 算法、独立实现不依赖
+    复杂形态）；任务寄存器表（任务 id 即下标）+ 轮转分发（g_sdq_spi % P）；新增窃取
+    计数观察量 `stolen_count` + 顶层符号 shim `stolen_count_s`（纯内置探针经
+    unsafe extern 直调）；worker 序号经 CreateThread arg3 传入（编译器
+    tig_s_pool_start 传 cnt，gen_s_pool_worker_eager 转发 param → pop_task(me,…)）；
+    文件级全局统一 `g_sdq_*` 前缀（tiec 裸名导出全局与 sched_ws 内联的
+    g_items/g_h/g_t/g_spi 链接期 LNK2005 多重定义根治）；`pool_idle_wait` 改
+    「无可取才等」防空队忙轮询热循环。
+  - 验收：`s_deque_probe`（失衡负载——制造者任务内 spawn 600 异构子任务刺激窃取 +
+    300 池复用批次）stolen=272~368、tid_set=4、len=900 无重复 PASS×3；p.6.7 全套
+    + m6_actor + spawn_demo 零回归；自举 tiec74→tiec75 字节不动点。
+
 - **p.6.7.6 简单形态真并行（S-pool 常驻线程池）**：
   - `core/mnn/sched.tie`：spawn_task 锁内入队 + pending++ + 广播唤醒（防轻任务
     单 worker 独吞）；`pop_task` 锁内原子摘头 + out 槽写回（wp_i64）；`task_done`

@@ -1,21 +1,40 @@
 type tie<class>
-// core/mnn/sched.tie —— trm-lite 简单形态执行内核（命名空间 trm_lite_sched，p.6.7.6）。
-// 阶段1的「协作式 M:N step 调度内核」（tick/run_all 轻量执行体）已被 p.6.7.6 的
-// S-pool 常驻线程池取代：简单形态真并行 = 内置 spawn 入队 → 常驻 worker 线程
-// 并行抢执行，yield = 同步点。本文件只保留 S-pool 线程安全队列 + 同步 + 任务
-// 入队/摘取（全部经 tl_k32 单一声明源，p.6.7.6）。
+// core/mnn/sched.tie —— trm-lite 简单形态执行内核（命名空间 trm_lite_sched，p.6.7.6/6.7.7）。
+// p.6.7.6 S-pool 常驻线程池：内置 spawn 入队 → 常驻 worker 线程并行抢执行，yield=同步点。
+// p.6.7.7 S-deque：把「单全局队列」升级为 per-worker 双端队列——owner 段尾 LIFO 自取、
+// 他段头 FIFO 窃取、段满溢出全局（复刻 sched_ws 算法、独立实现，不依赖复杂形态）；
+// 全部在单锁 g_cs_s 内完成（per-worker 细锁是复杂形态 p.6.7.9 的工作）。
+// 同步原语自持 tl_k32 纯声明源（p.6.7.6）。
 import "../../core/mnn/tl_k32.tie"
 
 const TRM_LITE_SCHED_VERSION: string = "0.1.0"
+const S_SEG_CAP: i64 = 256     // S-deque 每 worker 段容量（任务槽）
 
-// ---------- 闭包任务队列（spawn/yield 内置的运行时载体） ----------
-// 每个任务 = 一个「轻量执行体」：{entry, env, retcode}（entry/env 为闭包聚合的
-// 入口/环境指针，i64 承载；retcode = 返回形态编码，0=i64 / 1=void）。
+// ---------- 任务寄存器 ----------
+// 每个任务 = 寄存器行（任务 id 即下标）：{entry, env, retcode}（entry/env 为闭包
+// 聚合的入口/环境指针，i64 承载；retcode = 返回形态编码，0=i64 / 1=void）。
 // 由 tiec 内置 codegen 以 extern 符号调用本组函数；tie 源码侧扁平表存储。
-var g_tq_entry: table<i64>;           // 任务入口指针（entry）
-var g_tq_env: table<i64>;             // 任务环境指针（env）
-var g_tq_retcode: table<i64>;         // 任务返回形态编码
-var g_worker: i64 = 2                 // S-pool 池大小 M（set_workers/pool_workers）
+var g_sdq_regs_e: table<i64>;       // 任务入口指针（entry）
+var g_sdq_regs_v: table<i64>;       // 任务环境指针（env）
+var g_sdq_regs_r: table<i64>;       // 任务返回形态编码
+var g_worker: i64 = 2               // S-pool 池大小 P（set_workers → pool_workers）
+
+// ---------- S-deque：per-worker 双端队列 + 溢出（p.6.7.7） ----------
+//   · 每 worker 段预分配 P×S_SEG_CAP 槽 g_items（段固定不重叠）；
+//     g_h[me]..g_t[me] 左闭右开（owner 段尾 LIFO 自取）
+//   · 窃取 = 他人段头 FIFO（g_h[j]++），溢出 = 全局 g_ovf 队列（满段转入）
+//   · spawn 轮转分发：g_spi % P 选段；段满 → 溢出表
+// 全局名唯一前缀 g_sdq_：tiec 文件级 var 全局按裸名导出符号，sched_ws（复杂形态
+// 内联进用户模块）已占用 g_items/g_h/g_t/g_spi 等——避免与 tl_runtime.o（含
+// sched）链接期 LNK2005 多重定义（p.6.7.7 实测）。
+var g_sdq_items: table<i64>;        // P×S_SEG_CAP deque 槽（任务 id）
+var g_sdq_h: table<i64>;            // 每 worker 段头游标
+var g_sdq_t: table<i64>;            // 每 worker 段尾游标
+var g_sdq_ovf: table<i64>;          // 全局溢出队列（任务 id）
+var g_sdq_ovf_head: i64 = 0         // 溢出队头游标
+var g_sdq_spi: i64 = 0              // 轮转分发计数器（spawn 选段）
+var g_sdq_stolen_s: i64 = 0         // 窃取计数（他段头/溢出取走累计）
+var g_sdq_init: i64 = 0             // 段表惰性初始化标记
 
 // 任务返回形态编码（与 tiec builtin_expr 的 drain 分派对齐）：
 // retcode 0=i64 / 1=void，由编译器 codegen 以字面量传递（tig_s_pool_worker
@@ -24,14 +43,9 @@ var g_worker: i64 = 2                 // S-pool 池大小 M（set_workers/pool_w
 // 双成员 .a 结构后暴露）。契约以注释固化，不在运行库内留可导出符号。
 
 // ---------- p.6.7.6 S-pool：简单形态常驻线程池 ----------
-// 简单形态由「yield 手动驱动单线程排空」升级为**真并行**：
 //   · tiec 内置 spawn 入队后调 pool_try_start（闸）→ 程序侧发射的常驻 worker
-//     线程（tie_s_pool_worker，CreateThread 由编译器生成）并行抢任务执行；
-//   · 本文件只负责**线程安全队列 + 同步**（入队/抢任务/完成计数/同步点）：
-//     spawn_task（锁内 push + pend++ + 唤醒）、pop_task（锁内原子摘头 +
-//     out 槽写回）、task_done（pend-- + 空时广播）、yield_wait（同步点：
-//     等 pend==0，任务全跑完——对旧程序与「排空」观察等价）、
-//     pool_idle_wait（worker 空队限时等待防忙轮询）。
+//     线程（tie_s_pool_worker，CreateThread 由编译器生成，arg=worker 序号）并行
+//     抢任务执行；本文件负责**线程安全调度队列 + 同步**。
 //   · 池常驻：线程建起后不随 drain 终止（进程退出由 OS 回收）；
 //     yield 之后的再 spawn 直接复用既有线程（gate=1 不再重建）。
 
@@ -42,16 +56,16 @@ var g_cv_s: i64 = 0         // 队列 CONDITION_VARIABLE 缓冲地址
 var g_pool_gate: i64 = 0    // 池启动闸：首个 spawn 置 1（编译器据此建线程一次）
 var g_pend_s: i64 = 0       // 未完成任务数（排队 + 运行中）
 
-// ---------- 表全局惰性初始化（阶段1块2：trm_lite.a 静态链接时 main 不会初始化
+// ---------- 表全局惰性初始化（trm_lite.a 静态链接时 main 不会初始化
 // 库内表全局——@g = global ptr null，须在桥函数首次调用时创建；import 内联时
 // main 已初始化，本函数幂等无害） ----------
 var g_tl_sched_init: i64 = 0
 
 func tl_sched_ensure() {
     if g_tl_sched_init == 0 {
-        g_tq_entry = table_new_i64()
-        g_tq_env = table_new_i64()
-        g_tq_retcode = table_new_i64()
+        g_sdq_regs_e = table_new_i64()
+        g_sdq_regs_v = table_new_i64()
+        g_sdq_regs_r = table_new_i64()
         g_tl_sched_init = 1
     }
 }
@@ -68,10 +82,10 @@ pub func workers() -> i64 {
     return g_worker
 }
 
-// ---------- 闭包任务队列（spawn/yield 内置运行时） ----------
-// p.6.7.6：入队经 S-pool 线程安全路径（锁内 push + pend++ + 唤醒）。
-
-// 惰性建 CS/CV 缓冲（幂等；tl_k32 纯声明源自持）。
+// 惰性建 CS/CV + S-deque 段表（幂等；tl_k32 纯声明源自持）。
+// 竞态论证：段表由 main 侧首个 spawn 前的 pool_sync_ensure 一次性创建（此后
+// g_deque_init==1），worker 线程在首个 spawn 之后才由编译器建出——不存在两个
+// 线程同时看到 g_deque_init==0 的窗口（与 g_pool_ready 同论证）。
 func pool_sync_ensure() {
     if g_pool_ready == 0 {
         unsafe {
@@ -81,6 +95,28 @@ func pool_sync_ensure() {
             InitializeConditionVariable(g_cv_s)
         }
         g_pool_ready = 1
+    }
+    if g_sdq_init == 0 {
+        var P = pool_workers()
+        var cap = P * S_SEG_CAP
+        g_sdq_items = table_new_i64()
+        var i: i64 = 0
+        while i < cap {
+            table_push(g_sdq_items, 0)
+            i = i + 1
+        }
+        g_sdq_h = table_new_i64()
+        g_sdq_t = table_new_i64()
+        i = 0
+        while i < P {
+            table_push(g_sdq_h, 0)
+            table_push(g_sdq_t, 0)
+            i = i + 1
+        }
+        g_sdq_ovf = table_new_i64()
+        g_sdq_ovf_head = 0
+        g_sdq_spi = 0
+        g_sdq_init = 1
     }
 }
 func p_lock() {
@@ -115,21 +151,46 @@ func p_wait(ms: i64) -> i64 {
     }
 }
 
-// 入队一个轻量执行体（闭包入口/环境/返回形态）。锁内 push + pend++ + 唤醒。
-// 返回任务 id。首个 spawn 前不起线程（线程由编译器发 CreateThread 建，池常驻）。
+// 池内是否可取得任务（任一非空段 / 溢出未取尽）。锁内调用。
+func deque_any() -> i64 {
+    var w: i64 = 0
+    while w < len(g_sdq_h) {
+        if g_sdq_t[w] > g_sdq_h[w] {
+            return 1
+        }
+        w = w + 1
+    }
+    if g_sdq_ovf_head < len(g_sdq_ovf) {
+        return 1
+    }
+    return 0
+}
+
+// 入队一个轻量执行体（闭包入口/环境/返回形态）。p.6.7.7：轮转选段——
+// 段未满推段尾（owner LIFO 本地优先消费）；段满 → 溢出全局表。
+// 锁内 push + pending++ + 广播唤醒（防轻任务被单 worker 独吞）。返回任务 id。
 pub func spawn_task(entry: i64, env: i64, retcode: i64) -> i64 {
     tl_sched_ensure()
     p_lock()
-    var id: i64 = len(g_tq_entry)
-    table_push(g_tq_entry, entry)
-    table_push(g_tq_env, env)
-    table_push(g_tq_retcode, retcode)
+    var id: i64 = len(g_sdq_regs_e)
+    table_push(g_sdq_regs_e, entry)
+    table_push(g_sdq_regs_v, env)
+    table_push(g_sdq_regs_r, retcode)
+    var P = pool_workers()
+    var w = g_sdq_spi % P
+    g_sdq_spi = g_sdq_spi + 1
+    if g_sdq_t[w] < S_SEG_CAP {
+        g_sdq_items[w * S_SEG_CAP + g_sdq_t[w]] = id
+        g_sdq_t[w] = g_sdq_t[w] + 1
+    } else {
+        table_push(g_sdq_ovf, id)
+    }
     g_pend_s = g_pend_s + 1
-    var ws = pool_workers()  // 广播唤醒全部常驻 worker（防轻任务被单 worker 独吞）
-    var w: i64 = 0
-    while w < ws {
+    var ws = pool_workers()
+    var k: i64 = 0
+    while k < ws {
         p_wake()
-        w = w + 1
+        k = k + 1
     }
     p_unlock()
     return id
@@ -166,39 +227,58 @@ pub func pend_count() -> i64 {
     return p
 }
 
-// 锁内原子摘队头任务：无任务返回 0；有则返回 entry 并把 env/rc 写入
-// env_out/rc_out 槽（i64 地址；x64 ABI 逐字节写）。
-pub func pop_task(env_out: i64, rc_out: i64) -> i64 {
+// worker 抢任务（p.6.7.7，锁内一次完成）：① 自段尾 LIFO → ② 他段头 FIFO 窃取
+// （自段右旋扫描）→ ③ 全局溢出队头；命中则把 env/rc 写入 env_out/rc_out 槽
+// （i64 地址；x64 ABI 逐字节写）并返回 entry，全空返回 0。
+pub func pop_task(me: i64, env_out: i64, rc_out: i64) -> i64 {
     pool_sync_ensure()
     p_lock()
-    if len(g_tq_entry) == 0 {
+    var got: i64 = 0
+    var id: i64 = 0
+    // worker 序号越界保护（编译器传 0..P-1）
+    if me < 0 || me >= len(g_sdq_h) {
         p_unlock()
         return 0
     }
-    var e0 = g_tq_entry[0]
-    var v0 = g_tq_env[0]
-    var r0 = g_tq_retcode[0]
-    // 队头移除（无缩表原语：并行表重建）
-    var ne = table_new_i64()
-    var nv = table_new_i64()
-    var nr = table_new_i64()
-    var n = len(g_tq_entry)
-    var i: i64 = 1
-    while i < n {
-        table_push(ne, g_tq_entry[i])
-        table_push(nv, g_tq_env[i])
-        table_push(nr, g_tq_retcode[i])
-        i = i + 1
+    // ① 自段尾 LIFO
+    if g_sdq_t[me] > g_sdq_h[me] {
+        g_sdq_t[me] = g_sdq_t[me] - 1
+        id = g_sdq_items[me * S_SEG_CAP + g_sdq_t[me]]
+        got = 1
     }
-    g_tq_entry = ne
-    g_tq_env = nv
-    g_tq_retcode = nr
-    unsafe {
-        wp_i64(env_out, v0)
-        wp_i64(rc_out, r0)
+    // ② 他段头 FIFO 窃取
+    if got == 0 {
+        var P = len(g_sdq_h)
+        var r: i64 = 1
+        while got == 0 && r < P {
+            var j = (me + r) % P
+            if g_sdq_t[j] > g_sdq_h[j] {
+                id = g_sdq_items[j * S_SEG_CAP + g_sdq_h[j]]
+                g_sdq_h[j] = g_sdq_h[j] + 1
+                g_sdq_stolen_s = g_sdq_stolen_s + 1
+                got = 1
+            }
+            r = r + 1
+        }
+    }
+    // ③ 全局溢出队头
+    if got == 0 && g_sdq_ovf_head < len(g_sdq_ovf) {
+        id = g_sdq_ovf[g_sdq_ovf_head]
+        g_sdq_ovf_head = g_sdq_ovf_head + 1
+        g_sdq_stolen_s = g_sdq_stolen_s + 1
+        got = 1
+    }
+    if got == 1 {
+        unsafe {
+            wp_i64(env_out, g_sdq_regs_v[id])
+            wp_i64(rc_out, g_sdq_regs_r[id])
+        }
     }
     p_unlock()
-    return e0
+    if got == 1 {
+        return g_sdq_regs_e[id]   // 寄存器行只追加不改写，无锁读安全
+    }
+    return 0
 }
 
 // 任务完成（worker 执行后调用）：pend--，归零时广播（yield_wait 即时醒）。
@@ -225,11 +305,12 @@ pub func yield_wait() -> i64 {
 }
 
 // worker 空队限时等待（防忙轮询；被 spawn/task_done 唤醒或 2ms 超时——短超时
-// 提高轻任务批的并行抢占概率）。
+// 提高轻任务批的并行抢占概率）。p.6.7.7：无可取（pend==0 全部完成，或 task
+// 全在运行中）才等，避免「空队列忙轮询」热循环。
 pub func pool_idle_wait() {
     pool_sync_ensure()
     p_lock()
-    if len(g_tq_entry) == 0 && g_pend_s == 0 {
+    if g_pend_s == 0 || deque_any() == 0 {
         p_wait(2)
     }
     p_unlock()
@@ -243,52 +324,107 @@ pub func pool_shutdown() {
     g_pend_s = 0
     p_unlock()
 }
+
+// ---------- 观察量（p.6.7.7） ----------
+// 未入队执行（排队中）任务数：各段占用 + 溢出残量（锁内读）。
 pub func queued_count() -> i64 {
-    tl_sched_ensure()
-    return len(g_tq_entry)
-}
-// 队头任务三要素（drain 分派用；空队列返回 0）。
-pub func queued_entry() -> i64 {
-    tl_sched_ensure()
-    if len(g_tq_entry) == 0 {
-        return 0
+    pool_sync_ensure()
+    p_lock()
+    var n: i64 = 0
+    var w: i64 = 0
+    while w < len(g_sdq_h) {
+        n = n + (g_sdq_t[w] - g_sdq_h[w])
+        w = w + 1
     }
-    return g_tq_entry[0]
+    n = n + (len(g_sdq_ovf) - g_sdq_ovf_head)
+    p_unlock()
+    return n
+}
+// 队头任务三要素（drain 分派用；空队列返回 0）：取第一个非空段头 / 溢出队头。
+pub func queued_entry() -> i64 {
+    pool_sync_ensure()
+    p_lock()
+    var id = deque_head_id()
+    var e: i64 = 0
+    if id >= 0 {
+        e = g_sdq_regs_e[id]
+    }
+    p_unlock()
+    return e
 }
 pub func queued_env() -> i64 {
-    tl_sched_ensure()
-    if len(g_tq_entry) == 0 {
-        return 0
+    pool_sync_ensure()
+    p_lock()
+    var id = deque_head_id()
+    var v: i64 = 0
+    if id >= 0 {
+        v = g_sdq_regs_v[id]
     }
-    return g_tq_env[0]
+    p_unlock()
+    return v
 }
 pub func queued_retcode() -> i64 {
-    tl_sched_ensure()
-    if len(g_tq_entry) == 0 {
-        return 0
+    pool_sync_ensure()
+    p_lock()
+    var id = deque_head_id()
+    var r: i64 = 0
+    if id >= 0 {
+        r = g_sdq_regs_r[id]
     }
-    return g_tq_retcode[0]
+    p_unlock()
+    return r
 }
-// 移除队头任务（无缩表原语：并行表重建）。
+// 移除队头任务（与 queued_entry 同定位；空调用）。
 pub func queued_dequeue() {
-    tl_sched_ensure()
-    var ne = table_new_i64()
-    var nv = table_new_i64()
-    var nr = table_new_i64()
-    var n = len(g_tq_entry)
-    var i: i64 = 1
-    while i < n {
-        table_push(ne, g_tq_entry[i])
-        table_push(nv, g_tq_env[i])
-        table_push(nr, g_tq_retcode[i])
-        i = i + 1
+    pool_sync_ensure()
+    p_lock()
+    var w: i64 = 0
+    var done: i64 = 0
+    while w < len(g_sdq_h) && done == 0 {
+        if g_sdq_t[w] > g_sdq_h[w] {
+            g_sdq_h[w] = g_sdq_h[w] + 1
+            done = 1
+        }
+        w = w + 1
     }
-    g_tq_entry = ne
-    g_tq_env = nv
-    g_tq_retcode = nr
+    if done == 0 && g_sdq_ovf_head < len(g_sdq_ovf) {
+        g_sdq_ovf_head = g_sdq_ovf_head + 1
+    }
+    p_unlock()
+}
+// 队头任务 id（第一个非空段头 / 溢出队头）；空返回 -1。锁内调用。
+func deque_head_id() -> i64 {
+    var w: i64 = 0
+    while w < len(g_sdq_h) {
+        if g_sdq_t[w] > g_sdq_h[w] {
+            return g_sdq_items[w * S_SEG_CAP + g_sdq_h[w]]
+        }
+        w = w + 1
+    }
+    if g_sdq_ovf_head < len(g_sdq_ovf) {
+        return g_sdq_ovf[g_sdq_ovf_head]
+    }
+    return -1
+}
+
+// 窃取计数（p.6.7.7 新增观察量：他段头/溢出被取走次数，跨批次累计）。
+pub func stolen_count() -> i64 {
+    pool_sync_ensure()
+    p_lock()
+    var s = g_sdq_stolen_s
+    p_unlock()
+    return s
 }
 
 pub func module_version() -> string {
     return TRM_LITE_SCHED_VERSION
 }
+}
+
+// ---------- p.6.7.7 观测 shim ----------
+// 纯内置程序（无 import）无法按命名空间调 trm_lite_sched → 顶层平坦符号别名：
+// 探针 `unsafe extern fn stolen_count_s() -> i64` 直调（符号名与命名空间函数
+// 的稳定约定；仅观测，不影响调度语义）。
+func stolen_count_s() -> i64 {
+    return trm_lite_sched.stolen_count()
 }
