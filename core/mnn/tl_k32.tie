@@ -1,0 +1,22 @@
+type tie<class>
+// core/mnn/tl_k32.tie —— kernel32 同步/线程原语 extern **纯声明源**（零函数、零命名空间）。
+// tie 的 extern 声明按文件作用域且**跨文件不允许重名重复**：同一编译单元内两处同名
+// extern 报「重复定义」。本文件集中声明全部 kernel32 同步/线程原语一次，供各模块
+// import（文本内联）复用——sched（简单形态 S-pool，p.6.7.6）、sched_ws（复杂形态）、
+// tl_chan、tl_tbl、tl_sync 共用同一声明，避免同单元重复声明冲突。
+// 与 tl_sync 的分工：tl_sync 是「声明 + 命名空间封装函数」宿主（产出 tl_sync$* 符号，
+// 会在打包进 .o 成员时泄漏定义）；tl_k32 **只声明不定义任何函数**——任何成员/内联
+// 单元 import 后仅获得 extern 可见性，不产生符号，无跨成员链接期冲突。
+// x64 ABI：缓冲区地址以 i64 传（alloc + ptr_to_int），void 桥按 i64 返回声明。
+
+unsafe extern fn InitializeCriticalSection(cs: i64) -> i64
+unsafe extern fn DeleteCriticalSection(cs: i64) -> i64
+unsafe extern fn EnterCriticalSection(cs: i64) -> i64
+unsafe extern fn LeaveCriticalSection(cs: i64) -> i64
+unsafe extern fn InitializeConditionVariable(cv: i64) -> i64
+unsafe extern fn WakeConditionVariable(cv: i64) -> i64
+unsafe extern fn SleepConditionVariableCS(cv: i64, cs: i64, ms: i64) -> i64
+unsafe extern fn CreateThread(sec: i64, stack: i64, start: string, arg: i64, flags: i64, tid: i64) -> i64
+unsafe extern fn WaitForSingleObject(h: i64, ms: i64) -> i64
+unsafe extern fn CloseHandle(h: i64) -> i64
+unsafe extern fn Sleep(ms: i64) -> i64;

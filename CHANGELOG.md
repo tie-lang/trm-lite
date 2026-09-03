@@ -2,6 +2,45 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.7.6 简单形态真并行（S-pool 常驻线程池）**：
+  - `core/mnn/sched.tie`：spawn_task 锁内入队 + pending++ + 广播唤醒（防轻任务
+    单 worker 独吞）；`pop_task` 锁内原子摘头 + out 槽写回（wp_i64）；`task_done`
+    pend-- 归零广播；`yield_wait` 同步点；`pool_idle_wait` 空队 CV 限时；启动闸
+    `pool_try_start/pool_workers`；池常驻不随 drain 终止。
+  - 新增 `core/mnn/tl_k32.tie` **纯声明源**（kernel32 extern 零函数）——tl_sync /
+    tl_tbl / sched 共用，杜绝同单元 extern 重名且不产 `tl_sync$*` 符号（.o 成员
+    打包零泄漏，p.6.7.2 链接冲突根治面再收窄）。
+  - 编译器侧（tie-main）：惰性合成 `tie_s_pool_worker` + `tig_s_pool_start`
+    （CreateThread×P 常驻）；yield 内置重定义 = 同步点；actor 投递补池启动。
+  - 验收：`s_pool_par_probe`（纯内置 8 任务真并行 tid_set≥2、共享表 800 元素
+    无重复）PASS×5；m6_actor 7 正向探针 PASS；spawn_demo PASS；自举 fixpoint
+    字节一致。
+
+- **p.6.7.5 生命周期确定性（tie-main 编译器侧）**：str_cat 对直连链上临时释放
+  （`@tie_str_free_if_heap`，长串 >31B 才 free，短串池只读）；严格零外引用判定防
+  UAF；`chain_leak_probe`（8×2M 轮 6 段链）PASS + 二阶自举字节不动点。
+
+- **p.6.7.4 输出与运行时余项并发安全**（审计性验收，spec §8.4）：
+  `println` 单次 vararg printf（CRT 逐调用加锁）行级原子不撕裂；`to_string` 全内联
+  每调用新缓冲；SSO 原子 bump；表/通道/调度/GC 内部表全锁内。探针
+  `println_par_probe` + `println_checker`（400 行逐字节精确）PASS。
+
+- **p.6.7.3 全局读写原子化 + race 指南**：
+  - `tl_tbl` 锁原语自持 kernel32 CS extern（不 import tl_sync）→ `tl_runtime.o`
+    不再捆绑 `tl_sync$*`；`trm_lite.a` 重建为双成员（`tl_runtime.o` 仅含
+    sched/gc/tl_tbl，`tl_chan_lib.o` 含 chan+tl_sync），链接器按需提取——复杂形态
+    探针（内联 tl_sync）与简单形态内置（spawn/ch/表混用）同链零符号冲突。
+  - 通道句柄分配并发安全：`ch_open` 的 `g_ch_next++` + 平行数组追加复合临界区
+    由全局分配锁 `g_alloc_cs` 串行化（裸自增并发打开丢句柄/数组错位竞态根治）。
+  - tiec 编译器侧：`atomic<T>` 方法生成修复全局原子槽地址操作数 kind（kind 0 →
+    kind 3，`@g_sum` 直接引用）；此前全局 atomic 生成的 `atomicrmw/load atomic`
+    引用未定义 `%N`（闭包内尤甚）。store atomic relaxed 序非法问题探针侧规避
+    （Release/SeqCst）。
+  - 探针（tie-main/tests/_p67_probe/，全 PASS）：
+    `atomic_sum_probe`（8 任务 × 1000 fetch_add = 8000 精确 + 独立槽位 8000 +
+    CAS 换值）；`chan_open_par_probe`（8 任务并发开通道：句柄 1..8 各一次、通道
+    互不串扰）；回归 tbl_par/sso_par/mix_simple 零回归。
+
 - **p.6.7.1 SSO 短串池原子 bump**（分配器并发安全，tie-main 编译器侧）：
   简单/复杂形态共用字符串短串分配从 load→add→store 改为 atomicrmw fetch_add（seq_cst），
   多线程并发字符串构建拿到唯一不重叠块偏移、零 malloc 回退正确；

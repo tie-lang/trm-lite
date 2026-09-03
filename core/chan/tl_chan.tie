@@ -15,7 +15,9 @@ import "../../core/mnn/tl_sync.tie"
 const CH_MAX: i64 = 256       // 通道数上限
 const CH_CAP: i64 = 64        // 单通道环形容量
 
-var g_ch_next: i64 = 0        // 下一个通道句柄（1 起）
+var g_ch_next: i64 = 0        // 下一个通道句柄（1 起；并发打开由 g_alloc_cs 串行化）
+var g_alloc_cs: i64 = 0       // 全局分配锁（ch_open：句柄序号 + 平行数组追加复合临界区，
+                              //   p.6.7.3 全局读写原子化——裸 g_ch_next++ 并发打开丢句柄）
 var g_ch_cs: table<i64> = []  // 每通道 CRITICAL_SECTION 缓冲地址
 var g_ch_cv: table<i64> = []  // 每通道 CONDITION_VARIABLE 缓冲地址
 var g_ch_closed: table<i64> = []
@@ -29,6 +31,10 @@ namespace trm_lite_chan {
 // 一次初始化（幂等）。
 pub func ensure() {
     if g_ch_init == 0 {
+        unsafe {
+            g_alloc_cs = ptr_to_int(alloc(64))
+            tl_sync.cs_init(g_alloc_cs)
+        }
         g_ch_cs = table_new_i64()
         g_ch_cv = table_new_i64()
         g_ch_closed = table_new_i64()
@@ -45,6 +51,8 @@ pub func ensure() {
 }
 
 // 分配新 channel，返回句柄（1 起；达上限返回 0）。
+// p.6.7.3：句柄序号与平行数组追加是复合临界区——全程持全局分配锁防并发打开
+// 交错（丢句柄/平行数组错位）；CS/cv 缓冲分配在锁外（alloc 线程安全）。
 pub func ch_open() -> i64 {
     ensure()
     if g_ch_next >= CH_MAX {
@@ -60,13 +68,22 @@ pub func ch_open() -> i64 {
         cv = ptr_to_int(alloc(64))
         tl_sync.cv_init(cv)
     }
-    g_ch_next = g_ch_next + 1
-    var ch = g_ch_next
-    table_push(g_ch_cs, cs)
-    table_push(g_ch_cv, cv)
-    table_push(g_ch_closed, 0)
-    table_push(g_ch_head, 0)
-    table_push(g_ch_tail, 0)
+    var ch: i64 = 0
+    unsafe {
+        tl_sync.cs_enter(g_alloc_cs)
+        if g_ch_next >= CH_MAX {
+            tl_sync.cs_leave(g_alloc_cs)
+            return 0
+        }
+        g_ch_next = g_ch_next + 1
+        ch = g_ch_next
+        table_push(g_ch_cs, cs)
+        table_push(g_ch_cv, cv)
+        table_push(g_ch_closed, 0)
+        table_push(g_ch_head, 0)
+        table_push(g_ch_tail, 0)
+        tl_sync.cs_leave(g_alloc_cs)
+    }
     return ch
 }
 
@@ -176,6 +193,10 @@ pub func shutdown() {
             }
             i = i + 1
         }
+        unsafe {
+            tl_sync.cs_del(g_alloc_cs)
+        }
+        g_alloc_cs = 0
         g_ch_init = 0
     }
 }

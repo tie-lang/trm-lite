@@ -1,15 +1,30 @@
 type tie<class>
 // core/tbl/tl_tbl.tie —— trm-lite 字节层表容器（命名空间 tl_tbl）。
 // ============================================================
-// 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 32 字节句柄
-//   {cap@0, len@8, data@16, esz@24}（cap/len/esz 为 i64，data 为原始字节
-//   缓冲指针，均以 i64 承载）。tiec 以 extern 符号调用 tl_tbl$tbl_*。
+// 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 40 字节句柄
+//   {cap@0, len@8, data@16, esz@24, lock@32}（cap/len/esz 为 i64，data 为原始字节
+//   缓冲指针，lock 为 kernel32 CRITICAL_SECTION 缓冲指针，均以 i64 承载）。
+//   tiec 以 extern 符号调用 tl_tbl$tbl_*。
 // 纯 unsafe/ptr 裸内存实现（**零 table<T> 依赖**）——保证 trm_lite.a 可被
 // 任意表 codegen 的 tiec 重建而无自引用环（tbl_at 若用 table<i64> 记账会
 // 在「新表 codegen」下自调自身形成无限递归）。
 // 用户程序无需 import 本库——tiec 检测到表内置时自动链接。
 // 扩容语义对齐编译器旧内联 s21_table_grow：newcap = cap==0 ? max(8,need)
 //   : max(cap+cap/2, need)；新缓冲 alloc(newcap*esz) + memcpy 旧 len*esz 字节。
+// p.6.7.2 并发安全：句柄携带每表锁（kernel32 CS，本文件自持单一声明源，
+//   不 import tl_sync——tl_sync 会被复杂形态内联进调用方，tl_tbl 再 import 会
+//   使 tl_runtime.o 捆绑 tl_sync$* 与内联方链接期多重定义；自持后 tl_tbl.o
+//   仅含 tl_tbl$*，可被任意形态按需提取）；
+//   `tbl_push` 单步锁内完成 len/ensure/memcpy/set_len（表追加的并发竞态根治，
+//   对齐 Go「容器并发不安全，append 由运行时锁保护」）；tbl_at/tbl_set 持锁
+//   防与扩容 realloc 并发；tbl_ensure 保留（编译器编译期路径，同线程）。
+
+// p.6.7.2：锁原语自持 kernel32 extern（不 import tl_sync）——tl_sync 会被
+// 复杂形态（sched_ws/chan）内联进调用方，若 tl_tbl 再 import，tl_runtime.o
+// 将捆绑 tl_sync$* 与内联方链接期多重定义；自持后 tl_tbl.o 仅含 tl_tbl$*，
+// 可被任意形态程序按需提取而不撞符号。x64 ABI：CS 缓冲地址以 i64 传。
+// p.6.7.6：extern 声明改为共用 tl_k32 纯声明源（同单元不重名；不产生符号）。
+import "../mnn/tl_k32.tie"
 
 namespace tl_tbl {
 
@@ -34,17 +49,38 @@ unsafe fn r_i64(p: ptr<u8>, off: i64) -> i64 {
     return v
 }
 
-// 建空表：esz = 元素字节大小。返回句柄（i64 = 32 字节块指针）。
+// 每表锁：句柄 @32 存 CRITICAL_SECTION 缓冲地址（tbl_new 时 alloc+init）。
+// 自持 extern 后 tl_tbl.o 仅含 tl_tbl$*，任意形态程序按需提取不撞符号。
+unsafe fn lock_of(h: i64) -> i64 {
+    return r_i64(int_to_ptr(h), 32)
+}
+unsafe fn lock_enter(h: i64) {
+    unsafe {
+        EnterCriticalSection(lock_of(h));
+    }
+}
+unsafe fn lock_leave(h: i64) {
+    unsafe {
+        LeaveCriticalSection(lock_of(h));
+    }
+}
+
+// 建空表：esz = 元素字节大小。返回句柄（i64 = 40 字节块指针）。
 pub unsafe fn tbl_new(esz: i64) -> i64 {
-    var h = alloc(32)
+    var h = alloc(40)
     w_i64(h, 0, 0)     // cap = 0
     w_i64(h, 8, 0)     // len = 0
     w_i64(h, 16, 0)    // data = null
     w_i64(h, 24, esz)  // esz = 元素字节大小
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    w_i64(h, 32, ptr_to_int(lk))   // lock = CS 缓冲地址
     return ptr_to_int(h)
 }
 
-// 表长度：len(t) = [h+8]。
+// 表长度：len(t) = [h+8]（无锁读；并发 push 场景下 len 由 tbl_push 锁内提交）。
 pub unsafe fn tbl_len(h: i64) -> i64 {
     return r_i64(int_to_ptr(h), 8)
 }
@@ -54,9 +90,9 @@ pub unsafe fn tbl_esz(h: i64) -> i64 {
     return r_i64(int_to_ptr(h), 24)
 }
 
-// 扩容：若 need > cap → 增长（cap=0→8，否则 1.5x，至少 need）。
-// 返回 data ptr（i64）；扩容后缓冲可能换址。
-pub unsafe fn tbl_ensure(h: i64, need: i64) -> i64 {
+// 扩容（调用方已持锁）：若 need > cap → 增长（cap=0→8，否则 1.5x，至少 need）。
+// 返回 data ptr（i64）；扩容后缓冲可能换址（旧缓冲已 free）。
+unsafe fn ensure_locked(h: i64, need: i64) -> i64 {
     var p = int_to_ptr(h)
     var cap = r_i64(p, 0)
     var len = r_i64(p, 8)
@@ -82,36 +118,68 @@ pub unsafe fn tbl_ensure(h: i64, need: i64) -> i64 {
     return data
 }
 
-// 提交新长度（push 后调用）。
+// 公共扩容：持锁调用 ensure_locked（编译器编译期路径；对用户并发路径安全）。
+pub unsafe fn tbl_ensure(h: i64, need: i64) -> i64 {
+    lock_enter(h)
+    var d = ensure_locked(h, need)
+    lock_leave(h)
+    return d
+}
+
+// 提交新长度（push 后调用）。公共路径持锁；tbl_push 锁内直写。
 pub unsafe fn tbl_set_len(h: i64, n: i64) {
+    lock_enter(h)
     w_i64(int_to_ptr(h), 8, n)
+    lock_leave(h)
+}
+
+// 表追加（单步原子，p.6.7.2）：len/ensure/memcpy/set_len 全程持锁——
+// 多线程并发 push 不会互相覆盖/丢元素。src = 元素字节指针（esz 字节）。
+pub unsafe fn tbl_push(h: i64, src: i64) {
+    lock_enter(h)
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24)
+    var need = len + 1
+    var data = ensure_locked(h, need)
+    memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), esz)
+    w_i64(p, 8, need)
+    lock_leave(h)
 }
 
 // 表下标读：越界 → 写零 out（esz 字节）返回 0；否则拷 data+i*esz → out 返回 1。
+// 持锁（防与并发扩容 realloc 冲突）。
 pub unsafe fn tbl_at(h: i64, i: i64, out: i64) -> i64 {
+    lock_enter(h)
     var p = int_to_ptr(h)
     var len = r_i64(p, 8)
     var esz = r_i64(p, 24)
     var data = r_i64(p, 16)
+    var ok: i64 = 0
     if i < len {
         memcpy(int_to_ptr(out), int_to_ptr(data + i * esz), esz)
-        return 1
+        ok = 1
+    } else {
+        memset(int_to_ptr(out), 0, esz)
     }
-    memset(int_to_ptr(out), 0, esz)
-    return 0
+    lock_leave(h)
+    return ok
 }
 
-// 表下标写：越界静默返回 0；否则拷 src → data+i*esz 返回 1。
+// 表下标写：越界静默返回 0；否则拷 src → data+i*esz 返回 1。持锁。
 pub unsafe fn tbl_set(h: i64, i: i64, src: i64) -> i64 {
+    lock_enter(h)
     var p = int_to_ptr(h)
     var len = r_i64(p, 8)
     var esz = r_i64(p, 24)
     var data = r_i64(p, 16)
+    var ok: i64 = 0
     if i < len {
         memcpy(int_to_ptr(data + i * esz), int_to_ptr(src), esz)
-        return 1
+        ok = 1
     }
-    return 0
+    lock_leave(h)
+    return ok
 }
 
 }

@@ -1,22 +1,9 @@
 type tie<class>
 // core/mnn/tl_sync.tie —— trm-lite 同步原语宿主（p.6.5.3 拆分）
-// tie 的 extern 声明**按文件作用域**且**跨文件不允许重名重复**（实测：未声明
-// 的函数调用报「未定义的函数」，两文件各自声明同名 extern 报「重复定义」）。
-// 本宿主集中声明 kernel32 同步/线程原语一次，sched/gc 等执行层模块 import
-// 后经命名空间函数复用——单一声明源、无重定义冲突。
+// 命名空间封装函数（cs_*/cv_*/thr_*/sleep）单一声明源；kernel32 extern 声明
+// 已抽至 tl_k32.tie（纯声明，p.6.7.6）——本文件 import 复用，自身不再声明。
 // x64 ABI：缓冲区地址以 i64 传（alloc + ptr_to_int），void 桥按 i64 返回声明。
-
-unsafe extern fn InitializeCriticalSection(cs: i64) -> i64
-unsafe extern fn DeleteCriticalSection(cs: i64) -> i64
-unsafe extern fn EnterCriticalSection(cs: i64) -> i64
-unsafe extern fn LeaveCriticalSection(cs: i64) -> i64
-unsafe extern fn InitializeConditionVariable(cv: i64) -> i64
-unsafe extern fn WakeConditionVariable(cv: i64) -> i64
-unsafe extern fn SleepConditionVariableCS(cv: i64, cs: i64, ms: i64) -> i64
-unsafe extern fn CreateThread(sec: i64, stack: i64, start: string, arg: i64, flags: i64, tid: i64) -> i64
-unsafe extern fn WaitForSingleObject(h: i64, ms: i64) -> i64
-unsafe extern fn CloseHandle(h: i64) -> i64
-unsafe extern fn Sleep(ms: i64) -> i64
+import "../../core/mnn/tl_k32.tie"
 
 namespace tl_sync {
 

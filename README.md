@@ -59,7 +59,8 @@ tiec spawn_demo.tie -o spawn_demo.exe
 - `ch_recv(ch) -> i64`：取队首消息；**v**=消息值，**0**=空(未关)，**-1**=已关闭且排空。
 - `ch_close(ch) -> void`：置关闭位（幂等），唤醒等待者。
 
-验收载体：`tests/s10_exec/`（`exec_demo` 阶段 1 块 1 内核验收；`spawn_demo`/`spawn_void_demo` 块 2 内置验收）。
+验收载体：`tests/s10_exec/`（`spawn_demo`/`spawn_void_demo`/`closure_spawn_demo` 内置验收；
+阶段 1 的 `exec_demo` 轻量执行体内核探针已随 p.6.7.6 S-pool 取代旧内核而移除）。
 
 ## 快速开始（阶段 2 起：复杂形态 import 即选择）
 
