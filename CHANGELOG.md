@@ -1,5 +1,13 @@
 # trm-lite 变更日志
 
+## preview.3 — 2026-09-03
+
+- **p.6.7.1 SSO 短串池原子 bump**（分配器并发安全，tie-main 编译器侧）：
+  简单/复杂形态共用字符串短串分配从 load→add→store 改为 atomicrmw fetch_add（seq_cst），
+  多线程并发字符串构建拿到唯一不重叠块偏移、零 malloc 回退正确；
+  探针 `tie-main/tests/_p67_probe/sso_par_probe.tie`（P=4 · 8 任务 · fails=0 ·
+  dist_tid=4 · malloc=0）PASS；sso_probe / ctx_ws_demo / parity_chan_demo 零回归。
+
 ## preview.2 — 2026-09-02
 
 - **p.6.5.11 收尾**：preview.2 发布——README 全景更新（复杂形态入口全集 + 已知限制
