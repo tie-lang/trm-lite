@@ -2,6 +2,16 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.7.11 结构化并发 WaitGroup**：
+  - 新增 `core/mnn/wg.tie`（trm_lite_wg）：`wg_new/add/done/wait/count`（Go
+    sync.WaitGroup 语义）——每组合 CS/CV + 计数槽；计数读写全持组锁；句柄分配
+    持全局分配锁（复合临界区）；done 归零广播；wait 50ms 限时重查。
+  - `tl_runtime_ctx.ctx_wg_*` 双入口转发；内置 wg_*（tie-main 侧）。
+  - `wg_lib.tie` 独立切片入 `trm_lite.a`（三成员：tl_runtime.o + tl_chan_lib.o +
+    wg_lib.o）——复杂形态内联 wg 不提取成员，零链接期多重定义。
+  - 验收：wg_par/wg_par_ctx 探针（3 波 × 4 组 × 8 任务并发 done）len=96 无重复、
+    分组和精确（9744336）PASS×3；p.6.7 全套 + m6_actor + demos + 测试零回归。
+
 - **p.6.7.10 协作抢占统一（gosched 显式点 + 时间片插桩）**：
   - 简单形态（sched.tie）：`gosched()` 置 g_sdq_gosched_pend；`after_task(me)`
     （显式让出 / g_sdq_slice 时间片达 S_SLICE_LIMIT=8 清零让出）；`pool_give_wait`

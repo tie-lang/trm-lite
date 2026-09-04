@@ -1,0 +1,11 @@
+type tie<class>
+// 内置 wg_new/wg_add/wg_done/wg_wait 静态链接所需的 WaitGroup 内核（p.6.7.11）切面。
+// 仅定义 trm_lite_wg$*（不含 tl_tbl 等外部笼子桥梁——由既有 trm_lite.a 解析）。
+// 单独切片构建为独立 .a 成员（wg_lib.o）：复杂形态（import tl_runtime_ctx →
+// 内联 trm_lite_wg）程序按需不提取本成员 → 零链接期重复定义（p.6.7.11，与
+// tl_chan_lib 同策略）。
+import "core/mnn/wg.tie"
+
+namespace wg_builtin_anchor {
+// 占位：本库仅承载 wg import 的内容，无自有逻辑。
+}

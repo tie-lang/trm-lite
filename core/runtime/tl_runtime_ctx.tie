@@ -9,6 +9,7 @@ type tie<class>
 // 任务窃取 + M:N）；ctx_set_workers/ctx_stolen/ctx_completed 供控制与验收。
 // 后续切片同文件不拆 API、只换执行层实现（p.6.5.3 并发三色 / p.6.5.7 channel）。
 import "../../core/mnn/sched_ws.tie"
+import "../../core/mnn/wg.tie"
 import "../../core/gc/gc_tri.tie"
 import "../../core/chan/tl_chan.tie"
 
@@ -144,5 +145,22 @@ pub func ctx_ch_len(ch: i64) -> i64 {
 }
 pub func ctx_ch_count() -> i64 {
     return trm_lite_chan.ch_count()
+}
+
+// ---------- WaitGroup 语言入口（p.6.7.11：Go sync.WaitGroup 语义） ----------
+pub func ctx_wg_new() -> i64 {
+    return trm_lite_wg.wg_new()
+}
+pub func ctx_wg_add(h: i64, n: i64) {
+    trm_lite_wg.wg_add(h, n)
+}
+pub func ctx_wg_done(h: i64) {
+    trm_lite_wg.wg_done(h)
+}
+pub func ctx_wg_wait(h: i64) {
+    trm_lite_wg.wg_wait(h)
+}
+pub func ctx_wg_count(h: i64) -> i64 {
+    return trm_lite_wg.wg_count(h)
 }
 }
