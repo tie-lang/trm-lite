@@ -291,11 +291,11 @@ pub func after_task(me: i64) -> i64 {
     return r
 }
 
-// 让出等待：1ms 限时（计数锁+CV），给其它 worker 抢占机会。
+// 让出等待：1ms 限时（p.6.7.10）。p.6.7.13 修：不用调度 CV（cv_wait 与 drain/worker
+// 空闲等待共享 g_cv——被 ch_send 等持锁路径并发唤醒存在时序纠缠风险）；纯 Sleep(1)
+// 幂等让出，等价限时且零 CV 交互。
 func give_wait() {
-    cnt_enter()
-    var w = tl_sync.cv_wait(g_cv, g_cnt_lk, 1)
-    cnt_leave()
+    tl_sync.sleep(1)
 }
 
 // worker 主循环：p.6.7.9 细锁——自己段尾 LIFO（锁自段）→ 窃取他人段头 FIFO

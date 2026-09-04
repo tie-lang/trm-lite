@@ -2,6 +2,13 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.7.13 双形态并行验收矩阵**：
+  - tie-main 侧 `matrix_simple_probe`/`matrix_ctx_probe`：同一套确定性负载双形态
+    各跑一遍（4 生产者 × 25 消息各自通道 + gosched + wg 生命周期 + 顺序收集）——
+    stdout 跨形态逐字节一致（sum=151300 cnt=100 uniq=100 gs=20），PASS×3。
+  - 复杂形态 `give_wait` 改纯 Sleep(1)（等价限时让出、零调度 CV 交互纠缠）。
+  - 验收：18 探针 p.6.7 全套 + parity/combo/ctx_* + m6_actor + 测试零回归。
+
 - **p.6.7.12 channel Go 语义（close 广播 + select 多路收发）**：
   - `core/chan/tl_chan.tie`：ch_close 改 WakeAllConditionVariable 广播唤醒（全部
     阻塞 recv 醒来，先排空残留再统一 -1）；新增 `ch_select(handles, actions,
