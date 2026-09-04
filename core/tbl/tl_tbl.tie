@@ -1,10 +1,10 @@
 type tie<class>
 // core/tbl/tl_tbl.tie —— trm-lite 字节层表容器（命名空间 tl_tbl）。
 // ============================================================
-// 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 40 字节句柄
-//   {cap@0, len@8, data@16, esz@24, lock@32}（cap/len/esz 为 i64，data 为原始字节
-//   缓冲指针，lock 为 kernel32 CRITICAL_SECTION 缓冲指针，均以 i64 承载）。
-//   tiec 以 extern 符号调用 tl_tbl$tbl_*。
+// 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 48 字节句柄
+//   {cap@0, len@8, data@16, esz@24, lock@32, refcount@40}（cap/len/esz/refcount
+//   为 i64，data 为原始字节缓冲指针，lock 为 kernel32 CRITICAL_SECTION 缓冲指针，
+//   均以 i64 承载）。tiec 以 extern 符号调用 tl_tbl$tbl_*。
 // 纯 unsafe/ptr 裸内存实现（**零 table<T> 依赖**）——保证 trm_lite.a 可被
 // 任意表 codegen 的 tiec 重建而无自引用环（tbl_at 若用 table<i64> 记账会
 // 在「新表 codegen」下自调自身形成无限递归）。
@@ -18,6 +18,9 @@ type tie<class>
 //   `tbl_push` 单步锁内完成 len/ensure/memcpy/set_len（表追加的并发竞态根治，
 //   对齐 Go「容器并发不安全，append 由运行时锁保护」）；tbl_at/tbl_set 持锁
 //   防与扩容 realloc 并发；tbl_ensure 保留（编译器编译期路径，同线程）。
+// p.6.10.2 引用计数：句柄 @40 refcount——tbl_new 置 1；tbl_retain 增（拷贝句柄
+//   到新槽）；tbl_release 减（归零 → free data+lock+句柄）。编译器在表变量
+//   赋值/返回/作用域出口插桩 retain/release，使表内存可回收（tie 无自动回收）。
 
 // p.6.7.2：锁原语自持 kernel32 extern（不 import tl_sync）——tl_sync 会被
 // 复杂形态（sched_ws/chan）内联进调用方，若 tl_tbl 再 import，tl_runtime.o
@@ -65,19 +68,52 @@ unsafe fn lock_leave(h: i64) {
     }
 }
 
-// 建空表：esz = 元素字节大小。返回句柄（i64 = 40 字节块指针）。
+// 建空表：esz = 元素字节大小。返回句柄（i64 = 48 字节块指针）。
 pub unsafe fn tbl_new(esz: i64) -> i64 {
-    var h = alloc(40)
+    var h = alloc(48)
     w_i64(h, 0, 0)     // cap = 0
     w_i64(h, 8, 0)     // len = 0
     w_i64(h, 16, 0)    // data = null
     w_i64(h, 24, esz)  // esz = 元素字节大小
+    w_i64(h, 40, 1)    // refcount = 1（新建表由创建者持有）
     var lk = alloc(64)
     unsafe {
         InitializeCriticalSection(ptr_to_int(lk));
     }
     w_i64(h, 32, ptr_to_int(lk))   // lock = CS 缓冲地址
     return ptr_to_int(h)
+}
+
+// 引用计数 +1：句柄被拷贝到新槽（变量赋值/参数传递/返回值接管）时调用。
+pub unsafe fn tbl_retain(h: i64) {
+    var p = int_to_ptr(h)
+    var rc = r_i64(p, 40)
+    w_i64(p, 40, rc + 1)
+}
+
+// 引用计数 -1：归零则释放表内存（data 缓冲 + lock CS + 句柄块）。
+// 释放前不再加锁（归零 = 唯一所有权已断，无并发读者；并发场景由调用方保证
+// 同一句柄的最后 release 不再被其它线程使用——与 Go 容器并发不安全同纪律）。
+pub unsafe fn tbl_release(h: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var rc = r_i64(p, 40)
+    if rc <= 1 {
+        var data = r_i64(p, 16)
+        if data != 0 {
+            free(int_to_ptr(data))
+        }
+        var lk = r_i64(p, 32)
+        if lk != 0 {
+            unsafe {
+                DeleteCriticalSection(lk);
+            }
+            free(int_to_ptr(lk))
+        }
+        free(p)
+        return 0
+    }
+    w_i64(p, 40, rc - 1)
+    return rc - 1
 }
 
 // 表长度：len(t) = [h+8]（无锁读；并发 push 场景下 len 由 tbl_push 锁内提交）。

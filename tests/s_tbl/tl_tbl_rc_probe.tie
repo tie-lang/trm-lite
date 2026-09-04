@@ -1,0 +1,34 @@
+type tie<logic>
+// ============================================================
+// trm-lite tl_tbl 引用计数单测（p.6.10.2 步1）
+// 覆盖：tbl_new refcount=1 / retain 递增 / release 递减 / 归零释放。
+// 期望输出：1 2 1 0
+// ============================================================
+import "../../core/tbl/tl_tbl.tie"
+
+func main() {
+    unsafe {
+        // 1. 建表 esz=8 → refcount=1
+        var h = tl_tbl.tbl_new(8)
+        var data = tl_tbl.tbl_ensure(h, 2)
+        deref_write(int_to_ptr(data + 0), 7)
+        deref_write(int_to_ptr(data + 8), 9)
+        tl_tbl.tbl_set_len(h, 2)
+        // 读 refcount（句柄 @40）
+        var rc0 = deref(int_to_ptr(h + 40))
+        println(to_string(rc0))                          // 1
+
+        // 2. retain → 2
+        tl_tbl.tbl_retain(h)
+        var rc1 = deref(int_to_ptr(h + 40))
+        println(to_string(rc1))                          // 2
+
+        // 3. release → 1（未归零，内存不释放）
+        var rc2 = tl_tbl.tbl_release(h)
+        println(to_string(rc2))                          // 1
+
+        // 4. release → 0（归零释放；句柄不可再用，结束前释放）
+        var rc3 = tl_tbl.tbl_release(h)
+        println(to_string(rc3))                          // 0
+    }
+}

@@ -2,6 +2,25 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.10.2 步1：tl_tbl 表容器引用计数（tbl_retain/tbl_release）**：
+  - 句柄 40B→48B（新增 refcount@40）；`tbl_new` 置 1；`tbl_retain` 增（句柄拷贝
+    到新槽时调用）；`tbl_release` 减——归零释放 data 缓冲 + lock CS（含
+    DeleteCriticalSection）+ 句柄块。
+  - 背景（RCA）：tie 无自动回收（GC 显式 collect 制、与表容器无关），表内存
+    malloc 裸分配只增不减——长跑程序（哈希基准/网络服务）内存无界增长。本步为
+    编译器插桩（赋值/返回/作用域出口 retain/release）铺底。
+  - 验收：`tl_tbl_rc_probe` 引用计数探针 PASS（1→2→1→0，归零释放）；既有
+    `tl_tbl_probe` 输出逐字节一致零回归；`trm_lite.a` 已重建。
+
+  EN: p.6.10.2 step 1 — tl_tbl table container refcount (tbl_retain/tbl_release).
+  Handle 40B→48B (refcount@40); tbl_new=1; tbl_retain increments (when a handle is
+  copied to a new slot); tbl_release decrements and frees data buffer + lock CS
+  (DeleteCriticalSection) + handle at zero. Background (RCA): tie has no auto-reclaim,
+  table memory was malloc-only and grew unboundedly in long-running programs. This
+  step lays the runtime foundation for compiler retain/release instrumentation.
+  Acceptance: tl_tbl_rc_probe PASS (1→2→1→0); existing tl_tbl_probe byte-identical
+  (zero regression); trm_lite.a rebuilt.
+
 - **p.6.7.14 并行体系收尾（preview.3 定稿）**：
   - README 升 preview.3：状态行 + API 全景更新（简单形态 `gosched`/`wg_*`/
     `ch_close` 广播/`ch_select`；复杂形态 `ctx_gosched`/`ctx_wg_*`/
