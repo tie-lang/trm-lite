@@ -114,6 +114,10 @@ pub func ctx_task_exec_w(id: i64) -> i64 {
 pub func ctx_pool_threads() -> i64 {
     return trm_lite_ws.thread_count()
 }
+// p.6.7.10 协作抢占：显式让出点（不等待；任务体可调用，worker 在调度点让出 pop）
+pub func ctx_gosched() {
+    trm_lite_ws.gosched()
+}
 // 进程收尾清理（探针退出前调用）
 pub func ctx_shutdown() {
     trm_lite_ws.shutdown()

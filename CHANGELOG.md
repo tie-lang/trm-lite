@@ -2,6 +2,15 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.7.10 协作抢占统一（gosched 显式点 + 时间片插桩）**：
+  - 简单形态（sched.tie）：`gosched()` 置 g_sdq_gosched_pend；`after_task(me)`
+    （显式让出 / g_sdq_slice 时间片达 S_SLICE_LIMIT=8 清零让出）；`pool_give_wait`
+    1ms 让出；tiec worker codegen 在 task_done 后插桩。
+  - 复杂形态（sched_ws.tie）：`gosched/after_task/give_wait`（g_ws_* 前缀）；
+    worker_main done 记后插桩；ctx_gosched 转发；内置 gosched() 双形态分派。
+  - 验收：preempt_fair_simple/ctx 探针（6 长任务体内 gosched + 60 轻任务）
+    len=66 无重复 tid_set=4 PASS×3；p.6.7 全套 + m6_actor + demos + 测试零回归。
+
 - **p.6.7.9 复杂形态 per-P 细锁（C-deque）**：
   - `core/mnn/sched_ws.tie`：去全局单 CS——每 worker 段独立 CS（g_seg_lks[i]，
     窃取窗口缩小到目标段）+ 全局溢出队列细锁 g_ovf_lk + 短临界计数锁 g_cnt_lk

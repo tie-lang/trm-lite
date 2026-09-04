@@ -21,6 +21,7 @@ import "../../core/mnn/tl_sync.tie"
 import "../../core/gc/gc_tri.tie"
 
 const WS_SEG_CAP: i64 = 256   // 每 worker deque 段容量（task 槽）
+const WS_SLICE_LIMIT: i64 = 8 // 时间片上限（p.6.7.10：worker 连续取任务数）
 
 var g_workers: i64 = 4        // 池大小 P（set_workers 在首个 drain 前设置生效）
 var g_cv: i64 = 0             // 条件变量缓冲地址（配 g_cnt_lk）
@@ -51,6 +52,8 @@ var g_ths: table<i64> = []            // worker 线程句柄表
 var g_gc_th: i64 = 0                  // 后台回收器线程句柄
 var g_pool_up: i64 = 0                // 池常驻标记（p.6.7.8：起于首次 drain、止于 shutdown）
 var g_shutdown: i64 = 0               // 停机标记（p.6.7.8：worker/GC 见 1 退出，池销毁）
+var g_ws_slice_w: table<i64> = []      // 每 worker 时间片计数器（p.6.7.10）
+var g_ws_gosched_pend: i64 = 0         // 显式让出待消费数（gosched() 置位，p.6.7.10）
 
 namespace trm_lite_ws {
 
@@ -138,6 +141,12 @@ pub func ensure_state() {
         }
         g_items = it
         g_ovf = table_new_i64()
+        g_ws_slice_w = table_new_i64()
+        i = 0
+        while i < g_workers {
+            table_push(g_ws_slice_w, 0)
+            i = i + 1
+        }
         trm_lite_tgc.ensure()   // GC 内核就绪（后台回收器依赖）
         g_state_init = 1
     }
@@ -251,6 +260,44 @@ pub func queued_count() -> i64 {
     return p
 }
 
+// ---------- p.6.7.10 协作抢占（复杂形态）：gosched 显式点 + 时间片检查 ----------
+// 任务体为 fn() 原子执行体不可硬中断 → 抢占体现为调度点让出（worker 每任务完成
+// 后 after_task(me) 判定）：gosched()（内置，复杂形态指到本函数）置 g_ws_gosched_pend
+// → after_task 让出一次；时间片 g_ws_slice_w[me] 达 WS_SLICE_LIMIT → 清零让出。
+// 让出 = give_wait（1ms 限时，给其它 worker 抢单机会）。
+
+// 显式让出点：仅标记待让出一次（不等待）。
+pub func gosched() {
+    cnt_enter()
+    g_ws_gosched_pend = g_ws_gosched_pend + 1
+    cnt_leave()
+}
+
+// worker 每任务完成后的调度点检查：1 = 让出本轮 pop；0 = 立即续 pop。
+pub func after_task(me: i64) -> i64 {
+    cnt_enter()
+    var r: i64 = 0
+    if g_ws_gosched_pend > 0 {
+        g_ws_gosched_pend = g_ws_gosched_pend - 1
+        r = 1
+    } else {
+        g_ws_slice_w[me] = g_ws_slice_w[me] + 1
+        if g_ws_slice_w[me] >= WS_SLICE_LIMIT {
+            g_ws_slice_w[me] = 0
+            r = 1
+        }
+    }
+    cnt_leave()
+    return r
+}
+
+// 让出等待：1ms 限时（计数锁+CV），给其它 worker 抢占机会。
+func give_wait() {
+    cnt_enter()
+    var w = tl_sync.cv_wait(g_cv, g_cnt_lk, 1)
+    cnt_leave()
+}
+
 // worker 主循环：p.6.7.9 细锁——自己段尾 LIFO（锁自段）→ 窃取他人段头 FIFO
 // （逐目标段短锁）→ 全局溢出队头（溢出锁）→ 计账（计数锁）→ 执行 → done（计数锁）
 // → 空闲 cv_wait（计数锁）。常驻（p.6.7.8）：仅 g_shutdown==1 退出。
@@ -311,6 +358,11 @@ func worker_main(arg: i64) -> i64 {
             g_pending = g_pending - 1
             g_done = g_done + 1
             cnt_leave()
+            // p.6.7.10 调度点让出：显式 gosched 或时间片耗尽 → 1ms 让出（不抢下一单）
+            var gy = after_task(me)
+            if gy == 1 {
+                give_wait()
+            }
         } else {
             cnt_enter()
             if g_shutdown == 1 {
@@ -403,6 +455,11 @@ func reset_round() {
     g_spi = 0
     g_pending = 0
     g_active = 0
+    var i: i64 = 0
+    while i < len(g_ws_slice_w) {
+        g_ws_slice_w[i] = 0
+        i = i + 1
+    }
     cnt_leave()
 }
 

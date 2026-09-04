@@ -9,6 +9,7 @@ import "../../core/mnn/tl_k32.tie"
 
 const TRM_LITE_SCHED_VERSION: string = "0.1.0"
 const S_SEG_CAP: i64 = 256     // S-deque 每 worker 段容量（任务槽）
+const S_SLICE_LIMIT: i64 = 8   // 时间片上限（p.6.7.10：worker 连续取任务数）
 
 // ---------- 任务寄存器 ----------
 // 每个任务 = 寄存器行（任务 id 即下标）：{entry, env, retcode}（entry/env 为闭包
@@ -35,6 +36,10 @@ var g_sdq_ovf_head: i64 = 0         // 溢出队头游标
 var g_sdq_spi: i64 = 0              // 轮转分发计数器（spawn 选段）
 var g_sdq_stolen_s: i64 = 0         // 窃取计数（他段头/溢出取走累计）
 var g_sdq_init: i64 = 0             // 段表惰性初始化标记
+var g_sdq_slice: table<i64> = []    // 每 worker 时间片计数器（p.6.7.10）
+var g_sdq_gosched_pend: i64 = 0     // 显式让出待消费数（gosched() 置位）
+                                    // g_sdq_ 前缀：与复杂形态 sched_ws 内联同名
+                                    // 全局（g_slice_w/g_gosched_pend）免裸名冲突
 
 // 任务返回形态编码（与 tiec builtin_expr 的 drain 分派对齐）：
 // retcode 0=i64 / 1=void，由编译器 codegen 以字面量传递（tig_s_pool_worker
@@ -116,6 +121,12 @@ func pool_sync_ensure() {
         g_sdq_ovf = table_new_i64()
         g_sdq_ovf_head = 0
         g_sdq_spi = 0
+        g_sdq_slice = table_new_i64()
+        i = 0
+        while i < P {
+            table_push(g_sdq_slice, 0)
+            i = i + 1
+        }
         g_sdq_init = 1
     }
 }
@@ -313,6 +324,50 @@ pub func pool_idle_wait() {
     if g_pend_s == 0 || deque_any() == 0 {
         p_wait(2)
     }
+    p_unlock()
+}
+
+// ---------- p.6.7.10 协作抢占（简单形态）：gosched 显式点 + 时间片检查 ----------
+// 任务体为 fn() 原子执行体不可硬中断 → 抢占体现为**调度点让出**：worker 每跑完
+// 一个任务（task_done 后）调 after_task(me) 决定是否让出本轮 pop 权：
+//   · gosched()（内置）置 g_gosched_pend → after_task 立即让出一次；
+//   · 时间片：g_sdq_slice[me] 累加，达 S_SLICE_LIMIT → 清零并让出（防单 worker
+//     连轴独吞 pop 循环）。
+// 让出 = pool_give_wait（1ms 限时，即使有任务也短暂停，给其它 worker 抢单机会）。
+
+// 显式让出点（内置 gosched() 的运行时入口）：不等待，仅标记待让出一次。
+pub func gosched() {
+    pool_sync_ensure()
+    p_lock()
+    g_sdq_gosched_pend = g_sdq_gosched_pend + 1
+    p_unlock()
+}
+
+// worker 每任务完成后的调度点检查：返回 1 = 让出本轮 pop（显式 gosched 或时间片
+// 耗尽）；0 = 立即续 pop。锁内完成（计数器 + 标记复合状态）。
+pub func after_task(me: i64) -> i64 {
+    pool_sync_ensure()
+    p_lock()
+    var r: i64 = 0
+    if g_sdq_gosched_pend > 0 {
+        g_sdq_gosched_pend = g_sdq_gosched_pend - 1
+        r = 1
+    } else {
+        g_sdq_slice[me] = g_sdq_slice[me] + 1
+        if g_sdq_slice[me] >= S_SLICE_LIMIT {
+            g_sdq_slice[me] = 0
+            r = 1
+        }
+    }
+    p_unlock()
+    return r
+}
+
+// 让出等待：1ms 限时（不比 pool_idle_wait 的 2ms 长），给其它 worker 抢占机会。
+pub func pool_give_wait() {
+    pool_sync_ensure()
+    p_lock()
+    p_wait(1)
     p_unlock()
 }
 
