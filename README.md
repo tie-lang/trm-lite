@@ -1,6 +1,6 @@
 # trm-lite — tie 平台的 Go 式静态内置运行时
 
-> 状态：**preview.2**（p.6.5 完成：复杂形态 work-stealing 调度 + 并发三色 GC（分代/整理）+ 可迁移栈 + channel 语言原语 + actor mailbox 咬合）
+> 状态：**preview.3**（p.6.5 完成：复杂形态 work-stealing 调度 + 并发三色 GC（分代/整理）+ 可迁移栈 + channel 语言原语 + actor mailbox 咬合；p.6.7 完成：双形态并行体系——S-deque 窃取/C-pool 常驻池/C-deque per-P 细锁/协作抢占统一/WaitGroup/channel Go 语义（close 广播 + select）双形态验收矩阵全绿）
 
 trm-lite 为 tie 引入 **Go 式静态内置 runtime** 形态，对标 Go 把调度器/GC 以库形式**静态链接**进单一零依赖二进制。与 trm（字节码 VM，路线 B）**并行开发、互不干扰**。
 
@@ -57,7 +57,15 @@ tiec spawn_demo.tie -o spawn_demo.exe
 - `ch_open() -> i64`：分配新 channel（mailbox），返回句柄（1 起）。p.6.5.7。
 - `ch_send(ch, v) -> i64`：入队消息；**0**=成功，**1**=失败（通道关闭或队列满）。
 - `ch_recv(ch) -> i64`：取队首消息；**v**=消息值，**0**=空(未关)，**-1**=已关闭且排空。
-- `ch_close(ch) -> void`：置关闭位（幂等），唤醒等待者。
+- `ch_close(ch) -> void`：置关闭位（幂等），广播唤醒全部阻塞 recv（先排空残留再统一
+  -1，Go 语义，p.6.7.12）。
+- `ch_select(handles, actions, values) -> i64`：多路收发——平行数组按分支对齐
+  （1=recv/-1=send），锁内非阻塞轮询试用 + 1ms 限时重试，返回命中的分支索引，
+  未命中返回 -1（p.6.7.12；复杂形态 `ctx_ch_select` 语义一致）。
+- `gosched() -> void`：协作抢占显式让出点（双形态统一，p.6.7.10）。
+- `wg_new() -> i64` / `wg_add(h, n)` / `wg_done(h)` / `wg_wait(h)` / `wg_count(h)`：
+  结构化并发 WaitGroup（Go sync.WaitGroup 语义，done 归零广播；p.6.7.11；
+  复杂形态 `ctx_wg_*` 语义一致）。
 
 验收载体：`tests/s10_exec/`（`spawn_demo`/`spawn_void_demo`/`closure_spawn_demo` 内置验收；
 阶段 1 的 `exec_demo` 轻量执行体内核探针已随 p.6.7.6 S-pool 取代旧内核而移除）。
@@ -87,12 +95,21 @@ func main() {
 复杂形态语言层入口（`namespace tl_runtime_ctx`）：
 
 - `ctx_ensure()`：复杂运行时惰性初始化（幂等）
-- `ctx_set_workers(p)` / `ctx_workers()`：调度池大小（默认 4，须在首个 drain 前设置）
+- `ctx_set_workers(p)` / `ctx_workers()`：调度池大小（默认 4，须在首个 drain 前设置；
+  池启后拒改（段/线程失配防护，p.6.7.8））
 - `ctx_spawn(f: fn() -> i64) -> i64`：注册并入队函数值执行体，返回任务 id（p.6.5.2 起
-  多线程 work-stealing 承托：每 worker 独立双端队列 + 窃取 + 溢出队列）
+  多线程 work-stealing 承托：每 worker 独立双端队列 + 窃取 + 溢出队列；p.6.7.7 起
+  简单形态为 S-deque，p.6.7.9 起复杂形态为 C-deque per-P 细锁——自段→逐段窃取→
+  溢出单锁持有，无全局单 CS）
 - `ctx_queued() -> i64`：未完成任务数（排队 + 运行中）
-- `ctx_drain() -> i64`：并行 run——起 P 个 worker（kernel32 真线程）并发执行全部
-  就绪任务（含任务内再 spawn 的子任务），全部完成后回收池；返回本轮执行数
+- `ctx_drain() -> i64`：并行 run——**常驻池**（p.6.7.8：池起于首次 drain、止于
+  ctx_shutdown，worker 无可取时 cv/Sleep 限时存活，新一轮 spawn 唤醒，不每轮
+  rebuild）；返回本轮执行数。复杂形态 `give_wait` 为纯 Sleep(1) 限时让出
+  （p.6.7.13，零调度 CV 纠缠）
+- `ctx_gosched() -> void`：协作抢占显式让出点（p.6.7.10，与内置 gosched 同源语义；
+  时间片插桩见 sched.tie/sched_ws.tie `after_task`，`S_SLICE_LIMIT=8`）
+- `ctx_pool_threads() -> i64`：常驻池当前线程数（p.6.7.8）
+- `ctx_shutdown()`：置停机标记 + 广播 + join——真正销毁常驻池（p.6.7.8）
 - `ctx_collect() -> i64`：并发三色 GC 已回收对象总数（p.6.5.3；后台回收器随
   drain 与 worker 真并发推进，sweep 在无任务窗口执行）
 - `ctx_live_objs()` / `ctx_gc_steps()` / `ctx_gc_rounds()`：GC 观察量（存活数 / 标记推进步数 / 回收轮数）
@@ -102,7 +119,11 @@ func main() {
 - `ctx_migrated()` / `ctx_task_exec_w(id)`：可迁移栈观察量（p.6.5.5）
 - `ctx_stolen() -> i64` / `ctx_completed() -> i64`：跨轮累计窃取/完成任务数（验收观察量）
 - `ctx_ch_open()` / `ctx_ch_send(ch,v)` / `ctx_ch_recv(ch)` / `ctx_ch_close(ch)` /
-  `ctx_ch_len(ch)` / `ctx_ch_count()`：channel/mailbox 入口（p.6.5.7，复杂形态）
+  `ctx_ch_len(ch)` / `ctx_ch_count()`：channel/mailbox 入口（p.6.5.7，复杂形态）；
+  `ctx_ch_close` 广播唤醒全部阻塞 recv（p.6.7.12）；`ctx_ch_select(hp, ap, vp)`：
+  多路收发（分支 1=recv/-1=send，返回命中分支索引/-1，p.6.7.12）
+- `ctx_wg_new() -> i64` / `ctx_wg_add(h, n)` / `ctx_wg_done(h)` / `ctx_wg_wait(h)` /
+  `ctx_wg_count(h)`：结构化并发 WaitGroup（Go 语义，p.6.7.11）
 - `ctx_version() -> string`
 
 托管堆（p.6.5.3/6.5.4）：`trm_lite_tgc` 提供 `alloc(size) -> id` / `set_ref(from,k,to)`
@@ -113,16 +134,23 @@ major = 全量三色 + mark-compact（存活重排前段 + 边/根重写 + `rema
 精确根定义（p.6.5.6 拍板）：任务闭包 env 引用根集合（`add_root` + 写屏障维护），
 运行时 sweep 仅在「无任务窗口」（pending==0 && active==0）执行。
 
-## 已知限制（preview.2）
+## 已知限制（preview.3）
 
-- 任务为 `fn() -> i64` 原子执行体，运行中不可抢占；抢占体现为调度级（任务边界
-  让出 + 窃取均衡），时间片硬中断待语言级支持。「可迁移栈」语义落位为任务与
-  创建 worker 解耦（任意 worker 可执行 + 迁移计数），非 OS 级协程栈迁移。
+- 任务仍为 `fn() -> i64` 原子执行体；p.6.7.10 起协作抢占统一（双形态一致）——
+  仅在显式 `gosched()` 让出点与时间片插桩点（`S_SLICE_LIMIT=8`，见
+  `sched.tie`/`sched_ws.tie` `after_task`）主动让出，**非 OS 硬抢占**：两个让出点
+  之间任务不可被打断。「可迁移栈」语义落位为任务与创建 worker 解耦（任意 worker
+  可执行 + 迁移计数），非 OS 级协程栈迁移。
+- 带时序断言的老 demo（`ctx_ws_demo`/`ctx_gc_demo`/`combo_demo`：burst/步数/墙钟
+  等断言）在宿主负载升高时**偶发 FAIL**——时钟断言受宿主噪声，同一二进制低负载
+  必 PASS，属已知 flakiness 而非运行时回归；**并行体系验收一律以确定性 18 探针 +
+  双形态矩阵（stdout 逐字节一致）为准**，勿据此误判回归。
 - 精确根为「任务 env 即根」保守口径：任务运行期未显式登根/未建引用边的局部临时
   对象依赖「无任务窗口」而非逐帧栈图（精度损失已文档化，root_protect_demo 佐证）。
 - `ch_recv` 空队列（未关）返回 0（非阻塞降级），需调用方轮询/配合消息已达性约定；
   `ch_send` 队满返回 1（非阻塞降级）。Go 的阻塞 send/recv 语义需语言级挂起能力，
-  当前以返回值协商替代（复杂形态任务内可用 cv 等待，见 `ch_recv` 内部实现）。
+  当前以返回值协商替代（复杂形态任务内可用 cv 等待；p.6.7.12 起 `ch_close` 已按
+  Go 语义广播唤醒全部阻塞 recv，`ch_select` 提供锁内多路收发）。
 - channel 消息为标量 i64；对象/表消息需经 root 登记承载（p.6.5.8 actor 消息经
   单消息槽 + mailbox 令牌）。
 - actor 由 trm-lite 承载（内置 spawn/collect 路径）：`#[unsafe.trm]` 标注作为

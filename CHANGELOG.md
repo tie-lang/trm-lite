@@ -2,6 +2,24 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.7.14 并行体系收尾（preview.3 定稿）**：
+  - README 升 preview.3：状态行 + API 全景更新（简单形态 `gosched`/`wg_*`/
+    `ch_close` 广播/`ch_select`；复杂形态 `ctx_gosched`/`ctx_wg_*`/
+    `ctx_ch_select`/`ctx_pool_threads`/`ctx_shutdown`）+ 工程结构同步。
+  - 已知限制清单刷新：协作抢占仅在 gosched/时间片插桩点生效（非硬抢占）；
+    `ctx_ws/ctx_gc/combo` 带时序断言的老 demo 宿主负载升高时偶发 FAIL
+    （时钟断言受宿主噪声，低负载 PASS，非运行时回归）。
+  - 验收闭环：18 探针 p.6.7 全套 + 双形态矩阵 PASS×3/逐字节一致 + parity + m6_actor
+    + 测试全绿；tie-main 侧自举 tiec 字节不动点。
+
+  EN: p.6.7.14 finalization of the parallel system (preview.3 lock) — README bumped to
+  preview.3 with the full API surface (simple-form gosched/wg/ch_close broadcast/
+  ch_select; complex-form ctx_gosched/ctx_wg_*/ctx_ch_select/ctx_pool_threads/
+  ctx_shutdown); known limitations refreshed (cooperative preemption only at gosched/
+  timeslice checkpoints; legacy timing-asserted demos are host-noise-flaky, not a
+  regression). Closure: 18-probe suite + dual-form matrix + parity + m6_actor + tests
+  green; tie-main bootstrap tiec byte fixpoint.
+
 - **p.6.7.13 双形态并行验收矩阵**：
   - tie-main 侧 `matrix_simple_probe`/`matrix_ctx_probe`：同一套确定性负载双形态
     各跑一遍（4 生产者 × 25 消息各自通道 + gosched + wg 生命周期 + 顺序收集）——
