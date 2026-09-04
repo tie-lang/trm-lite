@@ -2,6 +2,16 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.7.9 复杂形态 per-P 细锁（C-deque）**：
+  - `core/mnn/sched_ws.tie`：去全局单 CS——每 worker 段独立 CS（g_seg_lks[i]，
+    窃取窗口缩小到目标段）+ 全局溢出队列细锁 g_ovf_lk + 短临界计数锁 g_cnt_lk
+    （pending/active/空判断/cv_wait 收敛，不做任务数据操作）+ 寄存器表追加锁
+    g_regs_lk；spawn/抢任务（自段→逐段窃取→溢出）/计账全部**单锁持有**
+    （无多锁嵌套死锁）；reset_round/shutdown 逐细锁；观察量经计数锁。
+  - 验收：`c_deque_perf_probe`（预热后 3 次测量）并行墙钟 < 串行 3/3（修复全局
+    锁退化拐点）、tid=4、基准计数 72、失衡负载 stolen=103~111、len=400 无重复、
+    3 轮句柄表恒定 PASS×3；p.6.7 全套 + m6_actor + demos + trm-lite 测试零回归。
+
 - **p.6.7.8 复杂形态常驻池（C-pool）**：
   - `core/mnn/sched_ws.tie`：池起于首次 drain、止于 ctx_shutdown——`g_pool_up`
     常驻标记 + `g_shutdown` 停机标记；worker 主循环「无可取 && pending==0 &&

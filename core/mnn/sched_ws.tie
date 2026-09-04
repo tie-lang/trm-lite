@@ -1,31 +1,36 @@
 type tie<class>
-// core/mnn/sched_ws.tie —— trm-lite 复杂形态 work-stealing 调度器（p.6.5.2 多线程 / p.6.5.3 并入后台回收器 / p.6.5.5 可迁移栈）
+// core/mnn/sched_ws.tie —— trm-lite 复杂形态 work-stealing 调度器（p.6.5.2 多线程 / p.6.5.3 并入后台回收器 / p.6.5.5 可迁移栈 / p.6.7.8 常驻池 / p.6.7.9 per-P 细锁）
 // 多 OS 线程池 + 每线程双端队列 + 任务窃取 + M:N 承托 + **并发三色 GC 后台回收器**：
 //   · 任务承载 = 注册表 g_regs（table<fn() -> i64>）+ 队列元素 regid（table<i64>）
 //   · 每线程双端队列 = g_items 预分配 P×SEG_CAP 槽（段固定不重叠）；owner 段尾
 //     LIFO 自取，他人段头 FIFO 窃取，段满溢出全局 g_ovf（p.6.5.2 定稿）
-//   · **可迁移栈（p.6.5.5）**：tie 任务为 fn() 原子执行体（无 OS 级协程栈迁移），
-//     「可迁移」语义落位为——任务与创建 worker 解耦，任意 worker 皆可执行：
-//       1) 任务执行 worker 登记 g_exec_w（spawn 时记创建者 g_orig_w）
-//       2) 迁移计数 g_migrated：worker ≠ 创建者 的执行（窃取/溢出取走）即迁移
-//       3) 运行中任务根保护：sweep 仅发生在「pending==0 && active==0」窗口，
-//          任务运行期间分配/存活对象天然受保护（GC 根 = 当前运行任务 env，
-//          降级保守根精度损失见设计 §6/§9）
-//   · 线程池按轮创建/回收（worker×P + GC×1）；同步 primitives 悉数经 tl_sync 宿主
-//     （tie extern 声明按文件作用域且跨文件不可重名——单一声明源）
-//   · 后台回收器：GC 线程与 worker 真并发推进三色标记（trm_lite_tgc.bg_step）；
-//     收敛发生在「无可取 && pending==0 && active==0」窗口（无写屏障 ⇒ sweep 安全）
-//   · 终止协议（p.6.5.2）：worker 仅当全部完成退出；pending/active 同锁原子视图
-//   · 抢占：任务为 fn() 原子执行体不可中断；时间片硬抢占待语言级中断支持
+//   · **可迁移栈（p.6.5.5）**：tie 任务为 fn() 原子执行体，「可迁移」= 任务与创建
+//     worker 解耦，任意 worker 皆可执行：g_exec_w 登记执行者；g_migrated 计数
+//     （worker≠创建者即迁移）；sweep 仅发生「pending==0 && active==0」窗口（任务
+//     运行期分配/存活对象受保护——GC 根 = 当前运行任务 env）
+//   · **p.6.7.9 per-P 细锁（去全局单 CS）**：每 worker 段独立 CS（g_seg_lks[i]，
+//     自取/窃取只锁目标段）、全局溢出队列独立锁 g_ovf_lk、计数+空判断+唤醒收敛
+//     短临界计数锁 g_cnt_lk（不做任何任务数据操作）、寄存器表追加锁 g_regs_lk。
+//     全程**单锁持有**（无嵌套多锁 → 无死锁）；窃取窗口缩小到目标段。锁序纪律：
+//     任意路径同时只持一把锁，跨锁操作逐把入/出。
+//   · 池常驻（p.6.7.8）：起于首次 drain、止于 shutdown；worker/GC 空闲 cv_wait
+//     存活，见 g_shutdown==1 退出。
+//   · 终止协议（p.6.5.2）：worker 仅当全部完成退出；pending/active 同锁原子视图。
+//   · 同步 primitives 单一声明源 tl_k32（经 tl_sync 命名空间封装）。
 import "../../core/mnn/tl_sync.tie"
 import "../../core/gc/gc_tri.tie"
 
 const WS_SEG_CAP: i64 = 256   // 每 worker deque 段容量（task 槽）
 
 var g_workers: i64 = 4        // 池大小 P（set_workers 在首个 drain 前设置生效）
-var g_cs: i64 = 0             // 全局 CRITICAL_SECTION 缓冲地址（调度锁，tl_sync 操作）
-var g_cv: i64 = 0             // 全局 CONDITION_VARIABLE 缓冲地址
+var g_cv: i64 = 0             // 条件变量缓冲地址（配 g_cnt_lk）
 var g_state_init: i64 = 0
+
+// p.6.7.9 细锁集合
+var g_cnt_lk: i64 = 0         // 计数/状态锁（pending/active/done/migrated/spi + 空判断 + CV 等待）
+var g_regs_lk: i64 = 0        // 寄存器表追加锁（g_regs/g_orig_w/g_exec_w append）
+var g_ovf_lk: i64 = 0         // 全局溢出队列细锁
+var g_seg_lks: table<i64> = []  // 每 worker 段 CS 缓冲地址（per-P 细锁）
 
 var g_regs: table<fn() -> i64> = []   // 任务注册表（regid = 下标；跨轮存活）
 var g_orig_w: table<i64> = []         // 每任务创建 worker（p.6.5.5 迁移判定）
@@ -49,7 +54,49 @@ var g_shutdown: i64 = 0               // 停机标记（p.6.7.8：worker/GC 见 
 
 namespace trm_lite_ws {
 
-// 一次初始化（幂等）。
+// ---------- 细锁封装（p.6.7.9；单锁持有纪律，杜绝多锁嵌套） ----------
+func cnt_enter() {
+    unsafe {
+        tl_sync.cs_enter(g_cnt_lk)
+    }
+}
+func cnt_leave() {
+    unsafe {
+        tl_sync.cs_leave(g_cnt_lk)
+    }
+}
+func regs_enter() {
+    unsafe {
+        tl_sync.cs_enter(g_regs_lk)
+    }
+}
+func regs_leave() {
+    unsafe {
+        tl_sync.cs_leave(g_regs_lk)
+    }
+}
+func ovf_enter() {
+    unsafe {
+        tl_sync.cs_enter(g_ovf_lk)
+    }
+}
+func ovf_leave() {
+    unsafe {
+        tl_sync.cs_leave(g_ovf_lk)
+    }
+}
+func seg_enter(i: i64) {
+    unsafe {
+        tl_sync.cs_enter(g_seg_lks[i])
+    }
+}
+func seg_leave(i: i64) {
+    unsafe {
+        tl_sync.cs_leave(g_seg_lks[i])
+    }
+}
+
+// 一次初始化（幂等）：建细锁集（P 段锁 + 溢出/计数/寄存器锁 + CV）+ 段表。
 pub func ensure_state() {
     // 标量全局初值在 tie 中被静默丢弃（`= 4` 实际 0）——强制默认池大小。
     if g_workers < 1 {
@@ -57,16 +104,27 @@ pub func ensure_state() {
     }
     if g_state_init == 0 {
         unsafe {
-            g_cs = ptr_to_int(alloc(64))
+            g_cnt_lk = ptr_to_int(alloc(64))
+            g_regs_lk = ptr_to_int(alloc(64))
+            g_ovf_lk = ptr_to_int(alloc(64))
             g_cv = ptr_to_int(alloc(64))
-            tl_sync.cs_init(g_cs)
+            tl_sync.cs_init(g_cnt_lk)
+            tl_sync.cs_init(g_regs_lk)
+            tl_sync.cs_init(g_ovf_lk)
             tl_sync.cv_init(g_cv)
         }
+        g_seg_lks = table_new_i64()
         g_h = table_new_i64()
         g_t = table_new_i64()
         g_ths = table_new_i64()
         var i: i64 = 0
         while i < g_workers {
+            var lk: i64 = 0
+            unsafe {
+                lk = ptr_to_int(alloc(64))
+                tl_sync.cs_init(lk)
+            }
+            table_push(g_seg_lks, lk)
             table_push(g_h, 0)
             table_push(g_t, 0)
             i = i + 1
@@ -85,7 +143,7 @@ pub func ensure_state() {
     }
 }
 
-// 池大小（须在首个 drain 前设置；改 P 会重建段表）。
+// 池大小（须在首个 drain 前设置；改 P 会重建段表 + 段锁）。
 pub func set_workers(m: i64) {
     // p.6.7.8：池已常驻后禁止改 P（段表重建与实际线程数失配）。
     if m < 1 || m == g_workers || g_pool_up == 1 {
@@ -93,15 +151,31 @@ pub func set_workers(m: i64) {
     }
     g_workers = m
     if g_state_init == 1 {
-        tl_sync.cs_enter(g_cs)
+        cnt_enter()
+        // 重建段锁（旧锁销毁；无并发窗口——首个 drain 前）
+        var i: i64 = 0
+        while i < len(g_seg_lks) {
+            unsafe {
+                tl_sync.cs_del(g_seg_lks[i])
+            }
+            i = i + 1
+        }
+        var lk: table<i64> = table_new_i64()
         var hi: table<i64> = table_new_i64()
         var ti: table<i64> = table_new_i64()
-        var i: i64 = 0
+        i = 0
         while i < g_workers {
+            var cs: i64 = 0
+            unsafe {
+                cs = ptr_to_int(alloc(64))
+                tl_sync.cs_init(cs)
+            }
+            table_push(lk, cs)
             table_push(hi, 0)
             table_push(ti, 0)
             i = i + 1
         }
+        g_seg_lks = lk
         g_h = hi
         g_t = ti
         var cap = g_workers * WS_SEG_CAP
@@ -118,128 +192,153 @@ pub func set_workers(m: i64) {
         g_spi = 0
         g_pending = 0
         g_active = 0
-        tl_sync.cs_leave(g_cs)
+        cnt_leave()
     }
 }
 pub func workers() -> i64 {
     return g_workers
 }
-// 调度锁地址（tl_runtime_ctx 汇总层可按需复用；当前 GC 用自有锁）。
+// 计数锁地址（tl_runtime_ctx 汇总层可按需复用；当前 GC 用自有锁）。
+// p.6.7.9：原全局单 CS 已拆细锁——对外暴露短临界计数锁（最接近原语义的宿主）。
 pub func sync_cs() -> i64 {
-    return g_cs
+    return g_cnt_lk
 }
 
-// 入队函数值执行体（含捕获闭包）：注册 → 轮转推段（满则溢出）。返回任务 id。
-// 任务内再 spawn 亦安全（全程持调度锁）。
+// 入队函数值执行体（含捕获闭包）：p.6.7.9 细锁分步——计数锁取轮转位 →
+// 寄存器锁追加 → 段锁写段（满则溢出锁转溢出表）→ 计数锁 pending++ + 唤醒。
+// 每步一把短锁，杜绝多锁嵌套。任务内再 spawn 亦安全。
 pub func spawn(f: fn() -> i64) -> i64 {
     ensure_state()
-    tl_sync.cs_enter(g_cs)
-    var regid: i64 = len(g_regs)
+    var w: i64 = 0
+    cnt_enter()
+    w = g_spi % g_workers
+    g_spi = g_spi + 1
+    cnt_leave()
+    var regid: i64 = 0
+    regs_enter()
+    regid = len(g_regs)
     table_push(g_regs, f)
-    var w = g_spi % g_workers
     table_push(g_orig_w, w)         // 创建 worker（p.6.5.5 迁移判定基准）
     table_push(g_exec_w, -1)        // 执行 worker 未定
+    regs_leave()
+    var to_ovf: i64 = 0
+    seg_enter(w)
     if g_t[w] < WS_SEG_CAP {
         g_items[w * WS_SEG_CAP + g_t[w]] = regid
         g_t[w] = g_t[w] + 1
     } else {
-        table_push(g_ovf, regid)
+        to_ovf = 1
     }
-    g_spi = g_spi + 1
+    seg_leave(w)
+    if to_ovf == 1 {
+        ovf_enter()
+        table_push(g_ovf, regid)
+        ovf_leave()
+    }
+    cnt_enter()
     g_pending = g_pending + 1
     tl_sync.cv_wake(g_cv)
-    tl_sync.cs_leave(g_cs)
-    return len(g_regs) - 1
+    cnt_leave()
+    return regid
 }
 
 // 未完成任务数（排队 + 运行中）。
 pub func queued_count() -> i64 {
     ensure_state()
-    tl_sync.cs_enter(g_cs)
+    cnt_enter()
     var p = g_pending
-    tl_sync.cs_leave(g_cs)
+    cnt_leave()
     return p
 }
 
-// worker 主循环：自己段尾 LIFO → 窃取他人段头 FIFO → 全局溢出队头 → 闲置等待。
-// p.6.7.8：常驻池——「无可取 && pending==0 && active==0」**不再退出**，改 cv_wait
-// 限时继续存活（新一轮 spawn 经 cv_wake 唤醒）；仅 g_shutdown==1 时退出（池销毁）。
+// worker 主循环：p.6.7.9 细锁——自己段尾 LIFO（锁自段）→ 窃取他人段头 FIFO
+// （逐目标段短锁）→ 全局溢出队头（溢出锁）→ 计账（计数锁）→ 执行 → done（计数锁）
+// → 空闲 cv_wait（计数锁）。常驻（p.6.7.8）：仅 g_shutdown==1 退出。
 func worker_main(arg: i64) -> i64 {
     var me = arg
     var last: i64 = 0
     while 1 {
         var got: i64 = 0
         var regid: i64 = 0
-        tl_sync.cs_enter(g_cs)
+        // ① 自段尾 LIFO（锁自段）
+        seg_enter(me)
         if g_t[me] > g_h[me] {
             var pos = g_t[me] - 1
             regid = g_items[me * WS_SEG_CAP + pos]
             g_t[me] = pos
             got = 1
         }
+        seg_leave(me)
+        // ② 窃取他人段头 FIFO（逐目标段短锁，拿/放完即解锁）
         var r: i64 = 1
         while got == 0 && r < g_workers {
             var j = (me + r) % g_workers
+            seg_enter(j)
             if g_t[j] > g_h[j] {
                 regid = g_items[j * WS_SEG_CAP + g_h[j]]
                 g_h[j] = g_h[j] + 1
                 g_stolen = g_stolen + 1
                 got = 1
             }
+            seg_leave(j)
             r = r + 1
         }
-        while got == 0 && g_ovf_head < len(g_ovf) {
-            regid = g_ovf[g_ovf_head]
-            g_ovf_head = g_ovf_head + 1
-            g_stolen = g_stolen + 1
-            got = 1
+        // ③ 全局溢出队头（溢出锁）
+        if got == 0 {
+            ovf_enter()
+            if g_ovf_head < len(g_ovf) {
+                regid = g_ovf[g_ovf_head]
+                g_ovf_head = g_ovf_head + 1
+                g_stolen = g_stolen + 1
+                got = 1
+            }
+            ovf_leave()
         }
+        // 计账（计数锁）：活跃++、执行 worker 登记、迁移计数
         if got == 1 {
+            cnt_enter()
             g_active = g_active + 1
-            // p.6.5.5 可迁移栈：登记执行 worker；worker≠创建者 → 迁移计数。
-            // 自取/窃取/溢出在此统一收敛（got 时即已决定取自何处）。
             g_exec_w[regid] = me
             if g_orig_w[regid] != me {
                 g_migrated = g_migrated + 1
             }
+            cnt_leave()
         }
-        tl_sync.cs_leave(g_cs)
         if got == 1 {
-            last = g_regs[regid]()
-            tl_sync.cs_enter(g_cs)
+            last = g_regs[regid]()   // 寄存器行只追加不改写，无锁读安全
+            cnt_enter()
             g_active = g_active - 1
             g_pending = g_pending - 1
             g_done = g_done + 1
-            tl_sync.cs_leave(g_cs)
+            cnt_leave()
         } else {
-            tl_sync.cs_enter(g_cs)
+            cnt_enter()
             if g_shutdown == 1 {
-                tl_sync.cs_leave(g_cs)
+                cnt_leave()
                 return last
             }
-            // 空闲：限时等待（新任务 spawn 唤醒；短路判断在醒来后于循环顶重来）
-            var w = tl_sync.cv_wait(g_cv, g_cs, 50)
-            tl_sync.cs_leave(g_cs)
+            // 空闲：限时等待（新任务 spawn 经 cv_wake 唤醒；醒来循环顶重查）
+            var w = tl_sync.cv_wait(g_cv, g_cnt_lk, 50)
+            cnt_leave()
         }
     }
 }
 
 // 后台回收器主循环（p.6.5.3）：与 worker 真并发推进三色标记；只有「无任务运行」
-// 窗口才做大批次，sweep 安全。p.6.7.8：常驻——一直在后台跑（含跨 drain 空闲
-// 窗口），仅 g_shutdown==1 时退出（池销毁 join）。
+// 窗口才做大批次，sweep 安全。p.6.7.8：常驻——仅 g_shutdown==1 时退出。
 func gc_worker_main(_: i64) -> i64 {
     var last: i64 = 0
     while 1 {
         var idle: i64 = 0
-        tl_sync.cs_enter(g_cs)
+        cnt_enter()
         if g_shutdown == 1 {
-            tl_sync.cs_leave(g_cs)
+            cnt_leave()
             return last
         }
         if g_pending == 0 && g_active == 0 {
             idle = 1
         }
-        tl_sync.cs_leave(g_cs)
+        cnt_leave()
         var batch: i64 = 64
         if idle == 1 {
             batch = 2000000
@@ -249,8 +348,7 @@ func gc_worker_main(_: i64) -> i64 {
     }
 }
 
-// 起池（p.6.7.8）：**常驻**——仅首次 drain 创建 P worker + 1 后台回收器；
-// 之后 ensure_pool 幂等直通（不再每轮重建/回收）。
+// 起池（p.6.7.8）：**常驻**——仅首次 drain 创建 P worker + 1 后台回收器。
 func ensure_pool() {
     if g_pool_up == 1 {
         return
@@ -285,37 +383,44 @@ func join_pool() {
     g_pool_up = 0
 }
 
-// 本轮状态复位（drain 收尾：无并发窗口，主线程独占）。
+// 本轮状态复位（drain 收尾：pending==0 无并发窗口，主线程独占；p.6.7.9 逐细锁清）。
 // g_done/g_stolen 跨轮累计（drain 返回本轮增量，观察量取累计）。
 // p.6.7.8：**不再清 g_ths**（线程句柄表是池资产，只随 join_pool 销毁）。
 func reset_round() {
+    var i: i64 = 0
+    while i < len(g_h) {
+        seg_enter(i)
+        g_h[i] = 0
+        g_t[i] = 0
+        seg_leave(i)
+        i = i + 1
+    }
+    ovf_enter()
+    g_ovf = table_new_i64()
+    g_ovf_head = 0
+    ovf_leave()
+    cnt_enter()
     g_spi = 0
     g_pending = 0
     g_active = 0
-    var i: i64 = 0
-    while i < len(g_h) {
-        g_h[i] = 0
-        g_t[i] = 0
-        i = i + 1
-    }
-    var of: table<i64> = table_new_i64()
-    g_ovf = of
-    g_ovf_head = 0
+    cnt_leave()
 }
 
 // 并行 run：P worker 并发执行全部任务（含任务内再 spawn）+ 后台回收器并发
-// 三色标记。p.6.7.8：等待本轮排空后**不做池回收**（池常驻）；句柄表恒定。
-// 返回本轮执行任务数（增量）。
+// 三色标记。p.6.7.8：等待本轮排空后**不做池回收**（池常驻）。返回本轮任务数（增量）。
 pub func drain() -> i64 {
     ensure_state()
-    var base = g_done
+    var base: i64 = 0
+    cnt_enter()
+    base = g_done
+    cnt_leave()
     ensure_pool()
-    tl_sync.cs_enter(g_cs)
+    cnt_enter()
     while g_pending > 0 {
-        var w = tl_sync.cv_wait(g_cv, g_cs, 50)
+        var w = tl_sync.cv_wait(g_cv, g_cnt_lk, 50)
     }
-    tl_sync.cs_leave(g_cs)
     var r = g_done - base
+    cnt_leave()
     reset_round()
     return r
 }
@@ -325,24 +430,24 @@ pub func thread_count() -> i64 {
     return len(g_ths)
 }
 
-// 观察量（跨轮累计）
+// 观察量（跨轮累计；探针在 drain 后单线程读取，细锁保证一致性）
 pub func completed_count() -> i64 {
-    tl_sync.cs_enter(g_cs)
+    cnt_enter()
     var d = g_done
-    tl_sync.cs_leave(g_cs)
+    cnt_leave()
     return d
 }
 pub func stolen_count() -> i64 {
-    tl_sync.cs_enter(g_cs)
+    cnt_enter()
     var s = g_stolen
-    tl_sync.cs_leave(g_cs)
+    cnt_leave()
     return s
 }
 // 迁移计数（p.6.5.5：worker≠创建者的执行次数，跨轮累计）
 pub func migrated_count() -> i64 {
-    tl_sync.cs_enter(g_cs)
+    cnt_enter()
     var m = g_migrated
-    tl_sync.cs_leave(g_cs)
+    cnt_leave()
     return m
 }
 // 任务执行 worker 分布：统计每 worker 实际执行了多少任务（跨轮累计核验
@@ -353,18 +458,36 @@ pub func exec_worker(id: i64) -> i64 {
     }
     return g_exec_w[id]
 }
-// 运行时全局清理（进程收尾）。p.6.7.8：真正池销毁——置停机标记 + 广播唤醒
-// （worker/GC 见 1 退出）→ join 全部线程 → 删段/锁。幂等。
+// 运行时全局清理（进程收尾）。p.6.7.8/6.7.9：真正池销毁——置停机标记 + 广播唤醒
+// （worker/GC 见 1 退出）→ join 全部线程 → 销毁全部细锁（段锁/溢出/计数/寄存器/CV）。
+// 幂等。
 pub func shutdown() {
     if g_state_init == 1 {
         if g_pool_up == 1 {
-            tl_sync.cs_enter(g_cs)
+            cnt_enter()
             g_shutdown = 1
             tl_sync.cv_wake(g_cv)
-            tl_sync.cs_leave(g_cs)
+            cnt_leave()
             join_pool()
         }
-        tl_sync.cs_del(g_cs)
+        unsafe {
+            tl_sync.cs_del(g_cnt_lk)
+            tl_sync.cs_del(g_regs_lk)
+            tl_sync.cs_del(g_ovf_lk)
+        }
+        // CONDITION_VARIABLE 无销毁语义（纯结构），无须删除
+        var i: i64 = 0
+        while i < len(g_seg_lks) {
+            unsafe {
+                tl_sync.cs_del(g_seg_lks[i])
+            }
+            i = i + 1
+        }
+        g_cnt_lk = 0
+        g_regs_lk = 0
+        g_ovf_lk = 0
+        g_cv = 0
+        g_seg_lks = table_new_i64()
         g_state_init = 0
     }
 }
