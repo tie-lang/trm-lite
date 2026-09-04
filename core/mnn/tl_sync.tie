@@ -37,6 +37,12 @@ pub func cv_wake(cv: i64) {
         WakeConditionVariable(cv);
     }
 }
+// p.6.7.12 close 广播：唤醒全部等待者（Win8+ WakeAllConditionVariable）。
+pub func cv_wake_all(cv: i64) {
+    unsafe {
+        WakeAllConditionVariable(cv);
+    }
+}
 pub func cv_wait(cv: i64, cs: i64, ms: i64) -> i64 {
     unsafe {
         return SleepConditionVariableCS(cv, cs, ms);

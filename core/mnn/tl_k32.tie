@@ -15,6 +15,7 @@ unsafe extern fn EnterCriticalSection(cs: i64) -> i64
 unsafe extern fn LeaveCriticalSection(cs: i64) -> i64
 unsafe extern fn InitializeConditionVariable(cv: i64) -> i64
 unsafe extern fn WakeConditionVariable(cv: i64) -> i64
+unsafe extern fn WakeAllConditionVariable(cv: i64) -> i64
 unsafe extern fn SleepConditionVariableCS(cv: i64, cs: i64, ms: i64) -> i64
 unsafe extern fn CreateThread(sec: i64, stack: i64, start: string, arg: i64, flags: i64, tid: i64) -> i64
 unsafe extern fn WaitForSingleObject(h: i64, ms: i64) -> i64

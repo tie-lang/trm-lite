@@ -2,6 +2,17 @@
 
 ## preview.3 — 2026-09-03
 
+- **p.6.7.12 channel Go 语义（close 广播 + select 多路收发）**：
+  - `core/chan/tl_chan.tie`：ch_close 改 WakeAllConditionVariable 广播唤醒（全部
+    阻塞 recv 醒来，先排空残留再统一 -1）；新增 `ch_select(handles, actions,
+    values)`——平行数组按分支对齐（1=recv/-1=send），锁内非阻塞轮询试用 +
+    1ms 限时重试；表参数按 tl_tbl 布局裸读写（成员零跨成员依赖）；tl_k32 新增
+    WakeAllConditionVariable 声明 + tl_sync cv_wake_all 封装。
+  - `tl_runtime_ctx.ctx_ch_select` 转发；内置 ch_select（tie-main 侧）。
+  - 验收：chan_select_probe（三分支可达计数 1/1/1 + 60 次并发 select 全取回 +
+    close 广播 4 reader 全 -1）PASS×3；parity_chan 逐字节一致；p.6.7 全套 +
+    m6_actor + demos + 测试零回归。
+
 - **p.6.7.11 结构化并发 WaitGroup**：
   - 新增 `core/mnn/wg.tie`（trm_lite_wg）：`wg_new/add/done/wait/count`（Go
     sync.WaitGroup 语义）——每组合 CS/CV + 计数槽；计数读写全持组锁；句柄分配

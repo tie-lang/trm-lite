@@ -146,6 +146,10 @@ pub func ctx_ch_len(ch: i64) -> i64 {
 pub func ctx_ch_count() -> i64 {
     return trm_lite_chan.ch_count()
 }
+// p.6.7.12 多路收发：ch_select(handles, actions, values) -> i64（命中分支下标/-1）
+pub func ctx_ch_select(hp: i64, ap: i64, vp: i64) -> i64 {
+    return trm_lite_chan.ch_select(hp, ap, vp)
+}
 
 // ---------- WaitGroup 语言入口（p.6.7.11：Go sync.WaitGroup 语义） ----------
 pub func ctx_wg_new() -> i64 {

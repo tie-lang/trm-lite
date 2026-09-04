@@ -14,6 +14,11 @@ import "../../core/mnn/tl_sync.tie"
 
 const CH_MAX: i64 = 256       // 通道数上限
 const CH_CAP: i64 = 64        // 单通道环形容量
+// p.6.7.12 ch_select 常项（文件级 const，命名空间体内禁止 const）
+const CH_SEL_RETRY: i64 = 20      // select 不可用时重试上限（×1ms）
+const CH_TBL_OFF_DATA: i64 = 16   // 表句柄 data 字段偏移
+const CH_TBL_OFF_LEN: i64 = 8     // 表句柄 len 字段偏移
+const RECV_NONE: i64 = 123456789  // 非阻塞 recv 哨兵（消息值不可能相等，探针避开此值）
 
 var g_ch_next: i64 = 0        // 下一个通道句柄（1 起；并发打开由 g_alloc_cs 串行化）
 var g_alloc_cs: i64 = 0       // 全局分配锁（ch_open：句柄序号 + 平行数组追加复合临界区，
@@ -150,6 +155,8 @@ pub func ch_recv(ch: i64) -> i64 {
 }
 
 // 关闭：幂等。之后 send 失败、recv 排空后返回 -1。
+// p.6.7.12：**广播唤醒**全部阻塞 recv（WakeAllConditionVariable）——close 后所有
+// 等待者依次醒来、先排空残留消息再统一返回 -1（Go 语义：close 后 recv 直到空）。
 pub func ch_close(ch: i64) {
     ensure()
     if ch < 1 || ch > g_ch_next {
@@ -160,9 +167,142 @@ pub func ch_close(ch: i64) {
     unsafe {
         tl_sync.cs_enter(cs)
         g_ch_closed[ch - 1] = 1
-        tl_sync.cv_wake(cv)
+        tl_sync.cv_wake_all(cv)
         tl_sync.cs_leave(cs)
     }
+}
+
+// ---------- p.6.7.12 ch_select：多路非阻塞收发（任一可用分支执行） ----------
+// 语言入口：ch_select(handles: table<i64>, actions: table<i64>, values: table<i64>)
+// -> i64。平行数组按分支下标对齐：actions[i] = 1 表示 recv 分支（命中即从通道
+// i 取一条写入 values[i]）、-1 表示 send 分支（命中即把 values[i] 发入通道 i）。
+// 返回值：命中的分支下标 i（0 起）；无可执行分支返回 -1。
+// 语义：轮询各通道**非阻塞**试用——recv 分支有消息即取（写回 values 槽）、send
+// 分支通道未关未满即入队（取 values 槽）；全不可用 → 1ms 限时重试（最多
+// CH_SEL_RETRY 次，共 ~20ms），与现有 ch_send/ch_recv 非阻塞降级一致。
+// 表参数以容器句柄（i64）传入：直接按 tl_tbl 布局
+// {cap@0, len@8, data@16, esz@24, lock@32} 以 unsafe 裸读写访问（esz=8，i64 元素），
+// 不依赖 tl_tbl 桥符号（tl_chan_lib.o 成员零跨成员依赖）。
+
+// 表句柄字段读取（len/data；unsafe 裸内存）。
+unsafe fn tbl_len(h: i64) -> i64 {
+    return rd64(h, CH_TBL_OFF_LEN)
+}
+unsafe fn tbl_data(h: i64) -> i64 {
+    return rd64(h, CH_TBL_OFF_DATA)
+}
+
+// 8 字节组装读/写（表元素 i64；与 tl_tbl r_i64/w_i64 同模式）。
+unsafe fn rd64(p: i64, off: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = deref(int_to_ptr(p + off + k))
+        v = v | (b << (k * 8))
+        k = k + 1
+    }
+    return v
+}
+unsafe fn wr64(p: i64, off: i64, v: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        deref_write(int_to_ptr(p + off + k), (v >> (k * 8)) & 255)
+        k = k + 1
+    }
+}
+
+// 表元素读/写（esz=8：句柄 data + i*8）
+unsafe fn tbl_get(h: i64, i: i64) -> i64 {
+    return rd64(tbl_data(h), i * 8)
+}
+unsafe fn tbl_set(h: i64, i: i64, v: i64) {
+    wr64(tbl_data(h), i * 8, v)
+}
+
+// ch_select 运行时入口（见上注释）。
+pub func ch_select(hp: i64, ap: i64, vp: i64) -> i64 {
+    ensure()
+    unsafe {
+        return ch_select_unsafe(hp, ap, vp)
+    }
+}
+
+// ch_select 安全/unsafe 拆层：表裸读写须 unsafe；对外保持 pub func 可安全调用。
+unsafe fn ch_select_unsafe(hp: i64, ap: i64, vp: i64) -> i64 {
+    var n = tbl_len(hp)
+    if n < 1 || n > tbl_len(ap) || n > tbl_len(vp) {
+        return -1
+    }
+    var tries: i64 = 0
+    while tries < CH_SEL_RETRY {
+        var i: i64 = 0
+        while i < n {
+            var ch = tbl_get(hp, i)
+            var act = tbl_get(ap, i)
+            if act == 1 {
+                // recv 分支：有消息即取（写回 values[i]）
+                var v = ch_recv_now(ch)
+                if v != RECV_NONE {
+                    tbl_set(vp, i, v)
+                    return i
+                }
+            } else if act == -1 {
+                // send 分支：未关未满即入队（取 values[i]）
+                var r = ch_send_now(ch, tbl_get(vp, i))
+                if r == 0 {
+                    return i
+                }
+            }
+            i = i + 1
+        }
+        if n < 1 {
+            return -1
+        }
+        tl_sync.sleep(1)
+        tries = tries + 1
+    }
+    return -1
+}
+
+// 非阻塞 recv：有消息 → 值；空/关闭 → RECV_NONE（哨兵）。
+func ch_recv_now(ch: i64) -> i64 {
+    if ch < 1 || ch > g_ch_next {
+        return RECV_NONE
+    }
+    var cs = g_ch_cs[ch - 1]
+    var res: i64 = RECV_NONE
+    unsafe {
+        tl_sync.cs_enter(cs)
+        if g_ch_tail[ch - 1] - g_ch_head[ch - 1] > 0 {
+            var k = (ch - 1) * CH_CAP + (g_ch_head[ch - 1] % CH_CAP)
+            res = g_ch_data[k]
+            g_ch_head[ch - 1] = g_ch_head[ch - 1] + 1
+        }
+        tl_sync.cs_leave(cs)
+    }
+    return res
+}
+
+// 非阻塞 send：成功 0；关闭或满 1。
+func ch_send_now(ch: i64, v: i64) -> i64 {
+    if ch < 1 || ch > g_ch_next {
+        return 1
+    }
+    var cs = g_ch_cs[ch - 1]
+    var cv = g_ch_cv[ch - 1]
+    var res: i64 = 1
+    unsafe {
+        tl_sync.cs_enter(cs)
+        if g_ch_closed[ch - 1] == 0 && g_ch_tail[ch - 1] - g_ch_head[ch - 1] < CH_CAP {
+            var k = (ch - 1) * CH_CAP + (g_ch_tail[ch - 1] % CH_CAP)
+            g_ch_data[k] = v
+            g_ch_tail[ch - 1] = g_ch_tail[ch - 1] + 1
+            tl_sync.cv_wake(cv)
+            res = 0
+        }
+        tl_sync.cs_leave(cs)
+    }
+    return res
 }
 
 // 观察量
