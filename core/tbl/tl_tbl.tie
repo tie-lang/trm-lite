@@ -92,9 +92,13 @@ pub unsafe fn tbl_retain(h: i64) {
 }
 
 // 引用计数 -1：归零则释放表内存（data 缓冲 + lock CS + 句柄块）。
+// 空句柄（0/null 槽未初始化）安全跳过——编译器插桩的旧值释放前无需判空。
 // 释放前不再加锁（归零 = 唯一所有权已断，无并发读者；并发场景由调用方保证
 // 同一句柄的最后 release 不再被其它线程使用——与 Go 容器并发不安全同纪律）。
 pub unsafe fn tbl_release(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
     var p = int_to_ptr(h)
     var rc = r_i64(p, 40)
     if rc <= 1 {
