@@ -29,6 +29,14 @@ type tie<class>
 // p.6.7.6：extern 声明改为共用 tl_k32 纯声明源（同单元不重名；不产生符号）。
 import "../mnn/tl_k32.tie"
 
+// r.1.1.4 深表标记：esz 高比特位（bit 62；bit 63 已被 map 哈希模式占用）。
+// 深表 = 元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release 对深表
+// 逐元素释放（元素自身是表，递归处理嵌套深度）；元素为标量/字符串/any 盒的
+// 普通表保持既有行为（数据缓冲整体释放，不逐元素）。标记随元素宽存 esz 字段，
+// 分配/拷贝尺寸一律按掩码后的纯 esz 计算。
+const TBL_DEEP: i64 = 4611686018427387904   // 1 << 62
+const TBL_MASK: i64 = 4611686018427387903   // 掩掉 bit62 保留低位尺寸
+
 namespace tl_tbl {
 
 // ---------- 句柄 i64 字段逐字节读写 ----------
@@ -84,6 +92,23 @@ pub unsafe fn tbl_new(esz: i64) -> i64 {
     return ptr_to_int(h)
 }
 
+// r.1.1.4 建深表：元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release
+// 释放时逐元素释放内层表。esz 字段写入深表标记位（分配尺寸按掩码后计算）。
+pub unsafe fn tbl_new_deep(esz: i64) -> i64 {
+    var hp = alloc(48)
+    w_i64(hp, 0, 0)
+    w_i64(hp, 8, 0)
+    w_i64(hp, 16, 0)
+    w_i64(hp, 24, esz | TBL_DEEP)
+    w_i64(hp, 40, 1)
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    w_i64(hp, 32, ptr_to_int(lk))
+    return ptr_to_int(hp)
+}
+
 // 引用计数 +1：句柄被拷贝到新槽（变量赋值/参数传递/返回值接管）时调用。
 pub unsafe fn tbl_retain(h: i64) {
     var p = int_to_ptr(h)
@@ -91,10 +116,11 @@ pub unsafe fn tbl_retain(h: i64) {
     w_i64(p, 40, rc + 1)
 }
 
-// 引用计数 -1：归零则释放表内存（data 缓冲 + lock CS + 句柄块）。
-// 空句柄（0/null 槽未初始化）安全跳过——编译器插桩的旧值释放前无需判空。
-// 释放前不再加锁（归零 = 唯一所有权已断，无并发读者；并发场景由调用方保证
-// 同一句柄的最后 release 不再被其它线程使用——与 Go 容器并发不安全同纪律）。
+// 引用计数 -1：归零则释放表内存（深表先逐元素释放内层表句柄，再释放
+// data 缓冲 + lock CS + 句柄块）。空句柄（0/null 槽未初始化）安全跳过——
+// 编译器插桩的旧值释放前无需判空。释放前不再加锁（归零 = 唯一所有权已断，
+// 无并发读者；并发场景由调用方保证同一句柄的最后 release 不再被其它线程
+// 使用——与 Go 容器并发不安全同纪律）。
 pub unsafe fn tbl_release(h: i64) -> i64 {
     if h == 0 {
         return 0
@@ -102,6 +128,22 @@ pub unsafe fn tbl_release(h: i64) -> i64 {
     var p = int_to_ptr(h)
     var rc = r_i64(p, 40)
     if rc <= 1 {
+        // r.1.1.4：深表逐元素释放——元素为 8 字节表句柄，递归释放（嵌套深度
+        // 任意层）；元素表由容器 release 与各自引用方 release 守恒（push 时
+        // 瞬态值已转移所有权 / 别名值已 retain）。
+        var esz = r_i64(p, 24)
+        if (esz & TBL_DEEP) != 0 {
+            var n = r_i64(p, 8)
+            var data = r_i64(p, 16)
+            var i: i64 = 0
+            while i < n {
+                var eh = r_i64(int_to_ptr(data + i * 8), 0)
+                if eh != 0 {
+                    tbl_release(eh)
+                }
+                i = i + 1
+            }
+        }
         var data = r_i64(p, 16)
         if data != 0 {
             free(int_to_ptr(data))
@@ -137,7 +179,7 @@ unsafe fn ensure_locked(h: i64, need: i64) -> i64 {
     var cap = r_i64(p, 0)
     var len = r_i64(p, 8)
     var data = r_i64(p, 16)
-    var esz = r_i64(p, 24)
+    var esz = r_i64(p, 24) & TBL_MASK   // 掩掉深表标记位（分配尺寸用纯 esz）
     if need > cap {
         var newcap: i64 = 8
         if cap > 0 {
@@ -179,7 +221,7 @@ pub unsafe fn tbl_push(h: i64, src: i64) {
     lock_enter(h)
     var p = int_to_ptr(h)
     var len = r_i64(p, 8)
-    var esz = r_i64(p, 24)
+    var esz = r_i64(p, 24) & TBL_MASK   // 掩掉深表标记位（拷贝宽度用纯 esz）
     var need = len + 1
     var data = ensure_locked(h, need)
     memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), esz)
@@ -193,7 +235,7 @@ pub unsafe fn tbl_at(h: i64, i: i64, out: i64) -> i64 {
     lock_enter(h)
     var p = int_to_ptr(h)
     var len = r_i64(p, 8)
-    var esz = r_i64(p, 24)
+    var esz = r_i64(p, 24) & TBL_MASK   // 掩掉深表标记位
     var data = r_i64(p, 16)
     var ok: i64 = 0
     if i < len {
@@ -211,7 +253,7 @@ pub unsafe fn tbl_set(h: i64, i: i64, src: i64) -> i64 {
     lock_enter(h)
     var p = int_to_ptr(h)
     var len = r_i64(p, 8)
-    var esz = r_i64(p, 24)
+    var esz = r_i64(p, 24) & TBL_MASK   // 掩掉深表标记位
     var data = r_i64(p, 16)
     var ok: i64 = 0
     if i < len {

@@ -162,15 +162,19 @@ pub func module_version() -> string {
 
 // ---------- 主流程：mark + sweep ----------
 // 从根出发做全扫标记：栈预先分配满容量（仅启动时 table_push 增长），热循环内用「索引写」，
-// 出边用扁平边表全扫（规避链式/扩容的 tiec 后端 bug）。返回可达对象数。
+// 标记可达对象：从精确根集出发全扫扁平边表（迭代、无递归）。
+// r.1.1.4：stack 表变量提升到函数入口声明——非入口块表变量会触发编译器
+// loopf 哨兵（tl_loopf_1 等），独立编译再静态链接的单元（trm_lite.a vs
+// 用户程序/编译器自举产物）同名哨兵 → LNK2005 多重定义。入口声明则走
+// 出口析构路径（本函数体无回边重写，语义等价）。
 pub func gc_mark() -> i64 {
+    var stack: table<i64> = table_new_i64()
     var i: i64 = 0
     while i < len(g_marked) {
         g_marked[i] = 0
         i = i + 1
     }
     var cap = len(g_marked)
-    var stack: table<i64> = table_new_i64()
     var k: i64 = 0
     while k < cap {
         table_push(stack, 0)
