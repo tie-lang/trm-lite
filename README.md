@@ -168,7 +168,9 @@ tiec core/mnn/tl_linux_shim.tie -o shim_linux.a --target x86_64-unknown-linux-gn
 clang --target=x86_64-unknown-linux-gnu -O1 -c core/mnn/linux_compat.c -o compat.o
 # 提取 .o 后合并：llvm-ar rcs trm_lite_linux.a tl_runtime.o tl_chan_lib.o wg_lib.o tl_linux_shim.o compat.o
 # （compat.o = r.1.6.6 的 `_gcvt`/`GetTickCount` POSIX shim——编译器自身 Windows CRT
-#   符号的 Linux 对等实现，随 .a 自动链入，无需在链接命令手挂）
+#   符号的 Linux 对等实现，随 .a 自动链入，无需在链接命令手挂；
+#   r.1.6.8 追加 `BCryptGenRandom`（std/csprng.tie `csrnd.strong_bytes` 的唯一 extern）
+#   getrandom(2) POSIX shim——Linux 无 bcrypt.dll，经本成员解析，tie 侧零改动）
 ```
 
 用户程序在 Linux 下经 `TIE_TRM_LITE_LIB` 指向 `trm_lite_linux.a`（或在仓库相对路径内）。
