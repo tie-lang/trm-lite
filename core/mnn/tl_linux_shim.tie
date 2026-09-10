@@ -1,0 +1,182 @@
+type tie<class>
+// core/mnn/tl_linux_shim.tie —— Linux 平台 Win32 同步/线程原语对等实现（r.1.6.5）
+// 目标：**同一份 tie 源码按平台分支**——trm-lite 各模块（sched/sched_ws/wg/tl_chan/
+// gc_tri/tl_tbl）一律按 tl_k32 的 Win32 符号名调用（EnterCriticalSection/CreateThread/
+// SleepConditionVariableCS/...），Windows 构建由 kernel32 解析；Linux 构建由本文件
+// 定义同名函数（pthread 实现）解析。编译器 spawn 内置合成的 CreateThread 调用
+//（tie_s_pool_worker 建常驻 worker）同样按符号名解析到本实现，无需编译器平台分支。
+// 本文件是**独立编译单元**（独立 .o 成员并入 trm_lite_linux.a）：tie 禁止同单元
+// extern 声明 + 同名函数定义（「重复定义」，实测 E00285），故不 import tl_k32，
+// 仅自持 tl_pthread 纯声明；其它成员（tl_runtime.o/tl_chan_lib.o/wg_lib.o）对
+// Win32 符号的未解析引用由链接器提取本成员解析——与 tl_chan_lib.o/wg_lib.o
+// 独立切片同策略（按需提取、零链接期重复定义）。
+// 内存模型：CS/CV 缓冲沿用调用方 alloc(64) 的地址（pthread_mutex_t=40B /
+// pthread_cond_t=48B，x64 均装入）；线程句柄 = 64B 槽地址 {pthread_t@0, fn@8,
+// arg@16, done@24}，线程入口 tl_shim_thread_entry 经 dyn_call 调原始函数指针
+//（i64(i64)，对齐 tie 命名函数/编译器 worker 的裸签名）。
+// 语义对齐：SleepConditionVariableCS 返回 1=唤醒（含伪唤醒，调用方循环重查谓词，
+// 与 Windows TRUE 一致）/ 0=超时（对齐 FALSE+ERROR_TIMEOUT）；WaitForSingleObject
+// 0=完成（WAIT_OBJECT_0）/ 258=超时（WAIT_TIMEOUT）；CreateThread 失败返回 0。
+import "../../core/mnn/tl_pthread.tie"
+
+// ---------- 8 字节组装读/写（i64 字段；对齐 tl_tbl r_i64/w_i64 模式） ----------
+unsafe fn r_i64(p: i64, off: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = deref(int_to_ptr(p + off + k))
+        v = v | (b << (k * 8))
+        k = k + 1
+    }
+    return v
+}
+unsafe fn w_i64(p: i64, off: i64, v: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        deref_write(int_to_ptr(p + off + k), (v >> (k * 8)) & 255)
+        k = k + 1
+    }
+}
+
+// ---------- 互斥锁（CRITICAL_SECTION 对等） ----------
+func InitializeCriticalSection(cs: i64) -> i64 {
+    unsafe {
+        return pthread_mutex_init(cs, 0)
+    }
+}
+func DeleteCriticalSection(cs: i64) -> i64 {
+    unsafe {
+        return pthread_mutex_destroy(cs)
+    }
+}
+func EnterCriticalSection(cs: i64) -> i64 {
+    unsafe {
+        return pthread_mutex_lock(cs)
+    }
+}
+func LeaveCriticalSection(cs: i64) -> i64 {
+    unsafe {
+        return pthread_mutex_unlock(cs)
+    }
+}
+
+// ---------- 条件变量（CONDITION_VARIABLE 对等） ----------
+func InitializeConditionVariable(cv: i64) -> i64 {
+    unsafe {
+        return pthread_cond_init(cv, 0)
+    }
+}
+func WakeConditionVariable(cv: i64) -> i64 {
+    unsafe {
+        return pthread_cond_signal(cv)
+    }
+}
+// p.6.7.12 close 广播（WakeAllConditionVariable 对等）：唤醒全部等待者。
+func WakeAllConditionVariable(cv: i64) -> i64 {
+    unsafe {
+        return pthread_cond_broadcast(cv)
+    }
+}
+// SleepConditionVariableCS(cv, cs, ms) -> BOOL：pthread_cond_timedwait 绝对超时
+//（clock_gettime(CLOCK_REALTIME=0) 取当前 + ms 构造截止 timespec）。
+// 返回 1 = 被唤醒（pthread 0；含伪唤醒——调用方循环重查谓词，与 Windows TRUE 语义
+// 一致）；0 = 超时（ETIMEDOUT 等非零，对齐 Windows FALSE/ERROR_TIMEOUT）。
+func SleepConditionVariableCS(cv: i64, cs: i64, ms: i64) -> i64 {
+    unsafe {
+        var ts = alloc(16)
+        clock_gettime(0, ptr_to_int(ts))
+        var sec = r_i64(ptr_to_int(ts), 0)
+        var nsec = r_i64(ptr_to_int(ts), 8)
+        nsec = nsec + (ms % 1000) * 1000000
+        sec = sec + ms / 1000
+        if nsec >= 1000000000 {
+            nsec = nsec - 1000000000
+            sec = sec + 1
+        }
+        w_i64(ptr_to_int(ts), 0, sec)
+        w_i64(ptr_to_int(ts), 8, nsec)
+        var r = pthread_cond_timedwait(cv, cs, ptr_to_int(ts))
+        free(ts)
+        if r == 0 {
+            return 1
+        }
+        return 0
+    }
+}
+
+// ---------- 线程（CreateThread/WaitForSingleObject/CloseHandle 对等） ----------
+// 线程槽：{pthread_t@0, fn@8, arg@16, done@24}；句柄 = 槽地址（i64）。
+// 入口：读 fn/arg → dyn_call 原始函数指针（i64(i64)，对齐 tie 命名函数/编译器
+// worker 裸签名）→ 置 done 再返回（WaitForSingleObject 轮询 done 判定完成）。
+func tl_shim_thread_entry(s: i64) -> i64 {
+    unsafe {
+        var fnp = r_i64(s, 8)
+        var arg = r_i64(s, 16)
+        var r = dyn_call(fnp, arg, 0, 0, 0, 0)
+        w_i64(s, 24, 1)
+        return r
+    }
+}
+// CreateThread(sec, stack, start, arg, flags, tid) -> HANDLE：pthread_create 建线程
+//（start = 函数指针，arg = 参数；sec/stack/flags/tid 为 Windows 专属，忽略）。
+// 失败（pthread_create 非 0）释放槽并返回 0（对齐 Windows 失败返回 NULL）。
+func CreateThread(sec: i64, stack: i64, start: string, arg: i64, flags: i64, tid: i64) -> i64 {
+    unsafe {
+        var slot = alloc(64)
+        w_i64(ptr_to_int(slot), 8, ptr_to_int(start))
+        w_i64(ptr_to_int(slot), 16, arg)
+        w_i64(ptr_to_int(slot), 24, 0)
+        var r = pthread_create(ptr_to_int(slot), 0, cb_ptr(tl_shim_thread_entry), ptr_to_int(slot))
+        if r != 0 {
+            free(slot)
+            return 0
+        }
+        return ptr_to_int(slot)
+    }
+}
+// WaitForSingleObject(h, ms) -> DWORD：轮询 done 标志（1ms 步进 nanosleep）；
+// 完成返回 0（WAIT_OBJECT_0），超时返回 258（WAIT_TIMEOUT）。sched_ws join_pool
+// 以 10000ms 兜底，worker 见停机标记即退出，正常路径必先 done。
+func WaitForSingleObject(h: i64, ms: i64) -> i64 {
+    unsafe {
+        var elapsed: i64 = 0
+        while elapsed < ms {
+            if r_i64(h, 24) == 1 {
+                return 0
+            }
+            var ts = alloc(16)
+            w_i64(ptr_to_int(ts), 0, 0)
+            w_i64(ptr_to_int(ts), 8, 1000000)
+            nanosleep(ptr_to_int(ts), 0)
+            free(ts)
+            elapsed = elapsed + 1
+        }
+        return 258
+    }
+}
+// CloseHandle(h)：done 后 pthread_join 收割 + 释放槽；未完成（join 前必先 wait 的
+// 异常路径）→ pthread_detach 防 UAF（槽 64B 泄漏，仅异常路径）。返回 0。
+func CloseHandle(h: i64) -> i64 {
+    unsafe {
+        var d = r_i64(h, 24)
+        if d == 1 {
+            pthread_join(h, 0)
+            free(int_to_ptr(h))
+        } else {
+            pthread_detach(h)
+        }
+        return 0
+    }
+}
+
+// ---------- Sleep(ms) 对等：nanosleep 限时 ----------
+func Sleep(ms: i64) -> i64 {
+    unsafe {
+        var ts = alloc(16)
+        w_i64(ptr_to_int(ts), 0, ms / 1000)
+        w_i64(ptr_to_int(ts), 8, (ms % 1000) * 1000000)
+        var r = nanosleep(ptr_to_int(ts), 0)
+        free(ts)
+        return r
+    }
+}

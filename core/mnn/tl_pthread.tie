@@ -1,0 +1,25 @@
+type tie<class>
+// core/mnn/tl_pthread.tie —— Linux pthread 同步/线程原语 extern **纯声明源**（零函数、零命名空间）。
+// r.1.6.5：tl_k32.tie（kernel32）的 Linux 对等物——Windows 构建由 kernel32 解析
+// CRITICAL_SECTION/CONDITION_VARIABLE/CreateThread，Linux 构建由 tl_linux_shim 以
+// pthread mutex/cond/thread 实现同名函数解析；两平台共用同一份 tie 运行库源码。
+// 本文件集中声明 trm-lite 用到的 pthread 原语一次，仅供 tl_linux_shim import（文本
+// 内联复用），不产生任何符号（对齐 tl_k32「只声明不定义」纪律）。
+// x64 ABI：pthread_mutex_t / pthread_cond_t / struct timespec 缓冲地址以 i64 传
+//（alloc + ptr_to_int）；void 桥按 i64 返回声明；线程入口（start）为函数指针按 ptr 传。
+
+unsafe extern fn pthread_mutex_init(m: i64, attr: i64) -> i64
+unsafe extern fn pthread_mutex_destroy(m: i64) -> i64
+unsafe extern fn pthread_mutex_lock(m: i64) -> i64
+unsafe extern fn pthread_mutex_unlock(m: i64) -> i64
+unsafe extern fn pthread_cond_init(cv: i64, attr: i64) -> i64
+unsafe extern fn pthread_cond_destroy(cv: i64) -> i64
+unsafe extern fn pthread_cond_signal(cv: i64) -> i64
+unsafe extern fn pthread_cond_broadcast(cv: i64) -> i64
+// 绝对超时等待（timespec 为 CLOCK_REALTIME 截止时间；0=被唤醒 / 非零=超时等错误码）
+unsafe extern fn pthread_cond_timedwait(cv: i64, m: i64, t: i64) -> i64
+unsafe extern fn pthread_create(th: i64, attr: i64, start: string, arg: i64) -> i64
+unsafe extern fn pthread_join(th: i64, ret: i64) -> i64
+unsafe extern fn pthread_detach(th: i64) -> i64
+unsafe extern fn clock_gettime(clk: i64, ts: i64) -> i64
+unsafe extern fn nanosleep(req: i64, rem: i64) -> i64;

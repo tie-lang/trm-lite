@@ -134,6 +134,60 @@ major = 全量三色 + mark-compact（存活重排前段 + 边/根重写 + `rema
 精确根定义（p.6.5.6 拍板）：任务闭包 env 引用根集合（`add_root` + 写屏障维护），
 运行时 sweep 仅在「无任务窗口」（pending==0 && active==0）执行。
 
+## 平台分支（r.1.6.5：Windows kernel32 / Linux pthread）
+
+trm-lite 的同步/线程原语按**同一份 tie 源码**平台分支，不 fork 两套实现：
+
+- **Windows**：各模块（`core/mnn/sched.tie`、`sched_ws.tie`、`wg.tie`、`core/chan/tl_chan.tie`、
+  `core/gc/gc_tri.tie`、`core/tbl/tl_tbl.tie`）按 `core/mnn/tl_k32.tie`（纯声明源）调用
+  kernel32 符号（`InitializeCriticalSection`/`EnterCriticalSection`/`CONDITION_VARIABLE`/
+  `CreateThread`/`SleepConditionVariableCS`…），由链接器对 kernel32 解析。
+- **Linux**：新增 `core/mnn/tl_pthread.tie`（pthread extern 纯声明源）+ `core/mnn/tl_linux_shim.tie`
+  （**Win32 同名函数**的 pthread 实现：CS→pthread_mutex、CV→pthread_cond、CreateThread→
+  pthread_create 经 64B 句柄槽 + `dyn_call` 承托线程入口、WaitForSingleObject→done 轮询、
+  Sleep→nanosleep）。tie 禁止同单元 extern 声明 + 同名函数定义（重复定义 E00285），故
+  shim 为**独立编译单元**（`tl_linux_shim.o` 成员），其余成员对 Win32 符号的引用由链接器
+  按需提取本成员解析——与 `tl_chan_lib.o`/`wg_lib.o` 独立切片同策略。编译器 spawn 内置
+  合成的 `CreateThread` 调用（tie_s_pool_worker 常驻池）亦按符号名解析到 shim，无需
+  编译器平台分支。
+
+### Linux 构建约定（交叉构建 trm_lite_linux.a）
+
+```powershell
+# Windows（既有，kernel32 解析）：三成员 trm_lite.a
+tiec core/runtime/tl_runtime.tie -o rt.a
+tiec tl_chan_lib.tie -o chan.a
+tiec wg_lib.tie -o wg.a
+# 提取 .o 后合并：llvm-ar rcs trm_lite.a tl_runtime.o tl_chan_lib.o wg_lib.o
+
+# Linux（pthread 解析）：四成员 trm_lite_linux.a（--target 交叉目标，clang -c 无链接无需 sysroot）
+tiec core/runtime/tl_runtime.tie -o rt_linux.a --target x86_64-unknown-linux-gnu
+tiec tl_chan_lib.tie -o chan_linux.a --target x86_64-unknown-linux-gnu
+tiec wg_lib.tie -o wg_linux.a --target x86_64-unknown-linux-gnu
+tiec core/mnn/tl_linux_shim.tie -o shim_linux.a --target x86_64-unknown-linux-gnu
+# 提取 .o 后合并：llvm-ar rcs trm_lite_linux.a tl_runtime.o tl_chan_lib.o wg_lib.o tl_linux_shim.o
+```
+
+用户程序在 Linux 下经 `TIE_TRM_LITE_LIB` 指向 `trm_lite_linux.a`（或在仓库相对路径内）。
+Linux 程序链接需 Linux CRT（CI/目标机环境）与 `-lpthread`（glibc<2.34；>=2.34 已并入 libc）。
+
+### Linux 待 CI 验证清单（r.1.6.5）
+
+- [ ] tiec 重建后（含 r.1.6.1 `link_exe` Linux 分支：`-fuse-ld=lld`、无扩展名 ELF 输出）跑
+      全链路 Linux 链接：spawn_demo / ctx_shell_demo 编译运行 PASS（本机仅验证到
+      clang+lld 链接冒烟——只缺 Linux CRT，无 Win32 未定义符号）。
+- [ ] 编译器侧 `is_libc_sym`（tie-main `backend/irgen.tie`）登记 pthread_mutex_*/pthread_cond_*/
+      pthread_create/join/detach、clock_gettime、nanosleep——复杂形态用户程序内联
+      tl_sync 后直调这些符号时不得置 `g_used_interp`（否则 Linux 链接误判 interp 桥报错）。
+- [ ] 复杂形态双形态矩阵 Linux 侧：matrix_ctx_probe 输出与 Windows 逐字节一致
+      （sum=151300 cnt=100 uniq=100 gs=20）；parity_chan（sum=804）等探针 PASS。
+- [ ] CI（ubuntu-latest，对齐 tie-main `.github/workflows/linux-r16.yml`）接入
+      trm_lite_linux.a 构建 + p.6.7 全套探针。
+
+已知限制（Linux）：复杂形态纯标量程序（无 `table<T>` 且无任何 trm-lite 内置）不触发
+`trm_lite_linux.a` 链接，内联的 tl_sync 对 Win32 符号的引用将未解析（Windows 经 kernel32
+隐式解析无此问题）；此类程序须使用表容器或任一 trm-lite 内置以触发链接。
+
 ## 已知限制（preview.3）
 
 - 任务仍为 `fn() -> i64` 原子执行体；p.6.7.10 起协作抢占统一（双形态一致）——

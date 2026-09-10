@@ -1,5 +1,53 @@
 # trm-lite 变更日志
 
+## r.1.6.5 — 2026-09-10
+
+- **同步/线程原语跨平台移植（Linux pthread）**：同一份 tie 源码按平台分支——
+  Windows 走 kernel32（CRITICAL_SECTION/CONDITION_VARIABLE/CreateThread），
+  Linux 走 pthread；不 fork 两套运行库。
+  - 新增 `core/mnn/tl_pthread.tie`（pthread extern **纯声明源**，tl_k32 的 Linux
+    对等物）：pthread_mutex_*/pthread_cond_*/pthread_create/join/detach/
+    clock_gettime/nanosleep。
+  - 新增 `core/mnn/tl_linux_shim.tie`（**独立编译单元**）：定义 Win32 同名函数
+    的 pthread 实现——Initialize/Enter/Leave/DeleteCriticalSection →
+    pthread_mutex_init/lock/unlock/destroy；InitializeConditionVariable/
+    Wake/WakeAll → pthread_cond_init/signal/broadcast；SleepConditionVariableCS →
+    clock_gettime+ms 构造绝对截止 timespec 的 pthread_cond_timedwait（返回
+    1=唤醒/0=超时，对齐 BOOL 语义）；CreateThread → 64B 句柄槽
+    {pthread_t@0, fn@8, arg@16, done@24} + 入口 `tl_shim_thread_entry` 经
+    `dyn_call` 调原始函数指针（编译器 spawn 合成路径 tie_s_pool_worker 亦解析）；
+    WaitForSingleObject → done 轮询（1ms 步进，0=完成/258=超时）；CloseHandle →
+    join/detach；Sleep → nanosleep。
+  - 构建：Linux 交叉产出四成员 `trm_lite_linux.a`（tl_runtime.o + tl_chan_lib.o +
+    wg_lib.o + **tl_linux_shim.o**）——tie 禁止同单元 extern 声明 + 同名函数定义
+    （E00285 实测），shim 独立成成员，链接器按需提取解析其余成员的 Win32 引用
+    （与 tl_chan_lib.o/wg_lib.o 独立切片同策略，零重复定义）。
+  - Windows 零回归：`trm_lite.a` 重建（tiec 08:56 版），trm-lite 仓内 6 探针 +
+    tie-main p.6.7/p.6.5 探针 22/23 PASS（matrix 双形态 ×3 逐字节一致
+    sum=151300 cnt=100 uniq=100 gs=20；parity sum=804；wg len=96 sum=9744336；
+    s_pool tid_set=2 len=800 dup=0；c_pool ths=4）。`ctx_ws_demo` FAIL 为既有
+    探针断言过时（`dt1 != 1` 与 p.6.7.8 常驻池语义冲突，自 p.6.7.8 起确定性
+    失败，与本改动无关）。
+  - Linux 验证：交叉构建 trm_lite_linux.a 符号闭包自洽（全归档未定义符号仅剩
+    libc/pthread）；clang+lld `--target=x86_64-unknown-linux-gnu` 链接冒烟
+    （spawn_demo 简单形态 / ctx_shell_demo 复杂形态）仅缺 Linux CRT，无 Win32
+    未定义符号。全链路运行待 CI（ubuntu-latest）与编译器侧配套
+    （is_libc_sym 登记 pthread/clock_gettime/nanosleep、Linux 链接行 -lpthread、
+    tiec 重建含 r.1.6.1 link_exe Linux 分支），见 README「Linux 待 CI 验证清单」。
+
+  EN: r.1.6.5 — cross-platform port of sync/thread primitives (Linux pthread).
+  Same tie source branches by platform: Windows uses kernel32 (CRITICAL_SECTION/
+  CONDITION_VARIABLE/CreateThread), Linux uses pthread — no forked runtime.
+  Added core/mnn/tl_pthread.tie (pure pthread extern declares) and
+  core/mnn/tl_linux_shim.tie (standalone unit defining Win32-named functions over
+  pthread; CreateThread via 64B handle slot + dyn_call trampoline). Linux builds a
+  4-member trm_lite_linux.a (tl_runtime.o + tl_chan_lib.o + wg_lib.o +
+  tl_linux_shim.o); the linker resolves Win32 refs from other members by extracting
+  the shim member on demand. Windows zero regression (rebuilt trm_lite.a, 22/23
+  probes PASS; matrix byte-identical ×3). Linux verified to cross-build with
+  self-consistent symbol closure and lld link smoke reaching only missing-CRT;
+  full-chain runtime validation pending CI + compiler-side support.
+
 ## preview.3 — 2026-09-03
 
 - **p.6.10.2 步1：tl_tbl 表容器引用计数（tbl_retain/tbl_release）**：
