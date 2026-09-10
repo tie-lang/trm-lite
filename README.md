@@ -166,11 +166,12 @@ tiec tl_chan_lib.tie -o chan_linux.a --target x86_64-unknown-linux-gnu
 tiec wg_lib.tie -o wg_linux.a --target x86_64-unknown-linux-gnu
 tiec core/mnn/tl_linux_shim.tie -o shim_linux.a --target x86_64-unknown-linux-gnu
 clang --target=x86_64-unknown-linux-gnu -O1 -c core/mnn/linux_compat.c -o compat.o
-# 提取 .o 后合并：llvm-ar rcs trm_lite_linux.a tl_runtime.o tl_chan_lib.o wg_lib.o tl_linux_shim.o compat.o
+# 提取 .o 后合并：llvm-ar rcs trm_lite_linux.a tl_runtime.o tl_chan_lib.o wg_lib.o tl_linux_shim.o compat.o linux_compat_regex.o
 # （compat.o = r.1.6.6 的 `_gcvt`/`GetTickCount` POSIX shim——编译器自身 Windows CRT
-#   符号的 Linux 对等实现，随 .a 自动链入，无需在链接命令手挂；
-#   r.1.6.8 追加 `BCryptGenRandom`（std/csprng.tie `csrnd.strong_bytes` 的唯一 extern）
-#   getrandom(2) POSIX shim——Linux 无 bcrypt.dll，经本成员解析，tie 侧零改动）
+#   符号的 Linux 对等实现，随 .a 自动链入，无需在链接命令手挂）
+# linux_compat_regex.o = r.1.6.11 的 tie_regex_* 五原语 POSIX 桥（内部 glibc regcomp/
+#   regexec，REG_EXTENDED）：regex_match/find/find_all/group/replace 运行期 pattern 的
+#   Rust 桥同名 C 实现，irgen 侧零改动；find_all 表句柄委托 tl_tbl$tbl_new 构建。
 ```
 
 用户程序在 Linux 下经 `TIE_TRM_LITE_LIB` 指向 `trm_lite_linux.a`（或在仓库相对路径内）。
