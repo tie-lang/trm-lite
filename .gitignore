@@ -6,6 +6,8 @@
 *.dll
 *.exp
 *.obj
+# r.1.6.5：trm_lite_linux.a 为引导二进制豁免入库（stage0 同构惯例，CI 拉取即用）
+!/trm_lite_linux.a
 
 # 构建缓存
 .tie-cache/
