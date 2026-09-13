@@ -1,6 +1,6 @@
 # trm-lite — tie 平台的 Go 式静态内置运行时
 
-> 状态：**preview.3**（p.6.5 完成：复杂形态 work-stealing 调度 + 并发三色 GC（分代/整理）+ 可迁移栈 + channel 语言原语 + actor mailbox 咬合；p.6.7 完成：双形态并行体系——S-deque 窃取/C-pool 常驻池/C-deque per-P 细锁/协作抢占统一/WaitGroup/channel Go 语义（close 广播 + select）双形态验收矩阵全绿；p.9.5.x 完成：显式并行池 API `trm_lite_ppool`——批量 fn 任务池，复用 S-pool 底座，并行度可配、跨提交复用，与 actor 单消费者语义正交）
+> 状态：**preview.3**（p.6.5 完成：复杂形态 work-stealing 调度 + 并发三色 GC（分代/整理）+ 可迁移栈 + channel 语言原语 + actor mailbox 咬合；p.6.7 完成：双形态并行体系——S-deque 窃取/C-pool 常驻池/C-deque per-P 细锁/协作抢占统一/WaitGroup/channel Go 语义（close 广播 + select）双形态验收矩阵全绿；p.9.5.x 完成：显式并行池 API `trm_lite_ppool`——批量 fn 任务池，复用 S-pool 底座，并行度可配、跨提交复用，与 actor 单消费者语义正交；**p.9.5.1/p.9.5.2 完成：生成器式协程运行期 `trm_lite_gen`——惰性序列/管道/无限流 + 多 worker 迁移/窃取共享消费（复用 S-deque 底座）**）
 
 trm-lite 为 tie 引入 **Go 式静态内置 runtime** 形态，对标 Go 把调度器/GC 以库形式**静态链接**进单一零依赖二进制。与 trm（字节码 VM，路线 B）**并行开发、互不干扰**。
 
@@ -136,6 +136,44 @@ PASS、exit 0）。
 
 验收载体：`tests/s10_exec/`（`spawn_demo`/`spawn_void_demo`/`closure_spawn_demo` 内置验收；
 阶段 1 的 `exec_demo` 轻量执行体内核探针已随 p.6.7.6 S-pool 取代旧内核而移除）。
+**注意（语言侧契约，2026-09-14）**：tiec f04962d（p.9.11.15）将 `yield` 落地为
+关键字后，内置 `yield()` 调用语法被遮蔽（解析期 E00543），本组探针暂无法用当前
+tiec 重编——语言侧待补（保留关键字对内置 `yield()` 的分流或迁移内置名），运行期
+入口 `trm_lite_sched$yield_wait` 完好，非 trm-lite 回归。
+
+## 生成器式协程运行期（p.9.5.1/p.9.5.2：trm_lite_gen 惰性流）
+
+**定位**：语言侧 `yield` 生成器（p.9.11.15）当前契约 = 急切攒表返回（签名登记
+`table<elem>`，for 直接消费，无运行期调用点）；惰性运行期按 p.9.11.16 迭代器
+协议（struct 实现 `has_next`/`next` 即被 for/推导式消费分派）在 trm-lite 承载：
+
+- **惰性序列**：`counter(lo, hi, step)` 有限 / `infinite(lo, step)` 无限——逐元素
+  按需产出，不一次性物化；
+- **管道组合**：`fmap(s, f)` / `filter(s, p)` / `take(s, n)` 全部惰性（无中间表，
+  map/filter 谓词仅在实际取用元素时调用——探针证 range 10 万仅调 5 次）；
+- **生成器互操作**：`from_table(t)` 惰性包装 tiec 生成器（yield）返回的表（句柄
+  retain 持有 + 逐元素读取；源表本身由语言侧急切生成，下游管道不物化）；
+- **多 worker 共享消费（p.9.5.2）**：`pull(s, out)` / `pull_id(id, out)` 原子拉取
+  （锁内推进）——任意 worker 可调，流挂起状态在全局注册表（不绑定 worker），
+  任务经 S-deque 窃取/迁移后继续消费不破坏惰性语义（每元素恰交付一次）。
+
+API（`namespace trm_lite_gen` + 可迭代 `struct Stream`，实现于 `core/gen/tl_gen.tie`，
+独立切片 `tl_gen_lib.o` 并入 trm_lite.a）：
+
+- `counter(lo, hi, step) -> Stream` / `infinite(lo, step) -> Stream`：惰性序列源。
+- `from_table(t: table<i64>) -> Stream`：惰性包装生成器/既有表。
+- `fmap(s, f: fn(i64) -> i64) -> Stream` / `filter(s, p: fn(i64) -> bool) -> Stream` /
+  `take(s, n) -> Stream`：惰性管道（`map` 为 tie 保留字故命名 `fmap`）。
+- `Stream::has_next/next`：p.9.11.16 协议——`for x in s` / 推导式直接消费
+  （**单消费者契约**；并发共享消费须用 pull）。
+- `pull(s, out) / pull_id(id, out) -> i64`：原子拉取（1=有值已写 out / 0=耗尽）。
+- `stream_count() -> i64`：观测（注册表流数）。
+
+验收载体：`tests/s_gen/gen_probe.tie`（有限序列 + 管道惰性证明 + 无限流截断 +
+生成器互操作 + 推导式；PASS、exit 0）；`tests/s_gen/gen_mig_probe.tie`（p.9.5.2：
+2 worker × 8 任务共享消费惰性管道流 0..63 与 take(infinite) 0..99——结果精确无
+重复无遗漏、双 worker 分派、S-deque 窃取观测非零（错峰错开段清空窗口）、池复用；
+压力多轮 PASS、exit 0）。
 
 ## 快速开始（阶段 2 起：复杂形态 import 即选择）
 
@@ -221,11 +259,14 @@ trm-lite 的同步/线程原语按**同一份 tie 源码**平台分支，不 for
 ### Linux 构建约定（交叉构建 trm_lite_linux.a）
 
 ```powershell
-# Windows（既有，kernel32 解析）：三成员 trm_lite.a
+# Windows（既有，kernel32 解析）：四成员 trm_lite.a
 tiec core/runtime/tl_runtime.tie -o rt.a
 tiec tl_chan_lib.tie -o chan.a
 tiec wg_lib.tie -o wg.a
-# 提取 .o 后合并：llvm-ar rcs trm_lite.a tl_runtime.o tl_chan_lib.o wg_lib.o
+tiec tl_gen_lib.tie -o gen.a
+# 提取 .o 后合并：llvm-ar rcs trm_lite.a tl_runtime.o tl_chan_lib.o wg_lib.o tl_gen_lib.o
+# （tl_gen_lib.o = p.9.5.1/p.9.5.2 生成器式协程切面；独立成员防内联 import 程序
+#   链接期重复定义，与 chan/wg 同策略）
 
 # Linux（pthread 解析）：五成员 trm_lite_linux.a（--target 交叉目标，clang -c 无链接无需 sysroot）
 tiec core/runtime/tl_runtime.tie -o rt_linux.a --target x86_64-unknown-linux-gnu
@@ -285,6 +326,18 @@ Linux 程序链接需 Linux CRT（CI/目标机环境）与 `-lpthread`（glibc<2
 - tie 相关既有缺陷（沿用，非本次引入）：标量全局初值静默丢弃（`=4` 实际 0）、
   `to_string(bool)` 输出 `-1`（true）/`0`（false）、顶层 `table<T>` 全局须带 `= []`
   初始化、单行块语句须以 `;` 结尾。
+- **p.9.5 语言侧契约差异（2026-09-14 实测，属 tiec 待补，非 trm-lite 回归）**：
+  - tiec f04962d（p.9.11.15）`yield` 关键字遮蔽内置 `yield()` 调用——语句位
+    `yield()` 解析为空元组报 E00543、表达式位报「无法以 Token105 开始表达式」；
+    内置 `yield()`（sched `trm_lite_sched$yield_wait` 同步点）语法不可达，`s10_exec`
+    探针暂无法用当前 tiec 重编。建议：关键字对 `yield (` 形态分流到内置调用，或
+    迁移内置名为 `yield_sync()`。
+  - 语言侧生成器为**急切攒表**（`yield v` → `table_push`，函数返回表）；真惰性
+    协程（yield 挂起/恢复）需 tiec 发射运行期调用点（如产出时回调 trm-lite），
+    当前以迭代器协议 + `from_table` 包装桥接，源表物化由语言侧负责。
+  - `for-in` 迭代器协议（has_next/next）为**单消费者**契约——并发共享消费同一
+    流必须用 `trm_lite_gen.pull/pull_id`（原子对）；跨文件 struct 值闭包捕获会
+    env 截断（探针须捕获 id + 用全局），已按此约束写探针。
 - 复杂形态汇总库（import tl_runtime_ctx 或多模块聚合 import）的重编译受 LLVM opt
   严格 declare+define 同模块冲突约束：channel 切片以 `tl_chan_lib.tie` 独立构件
   并入 `trm_lite.a`（构建方法见仓库）。

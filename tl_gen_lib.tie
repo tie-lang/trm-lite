@@ -1,0 +1,11 @@
+type tie<class>
+// tl_gen_lib.tie —— 生成器式协程运行期（p.9.5.1/9.5.2）切面。
+// 定义 trm_lite_gen$* + Stream 可迭代协议（has_next/next）；tl_tbl$*/tl_k32
+// extern 由既有 trm_lite.a（tl_runtime.o）解析。独立切片构建（tl_gen_lib.o
+// 成员）：内联 import tl_gen 的程序（探针）按需不提取本成员 → 零链接期重复
+// 定义（与 tl_chan_lib/wg_lib 同策略）。
+import "core/gen/tl_gen.tie"
+
+namespace gen_builtin_anchor {
+// 占位：本库仅承载 tl_gen import 的内容，无自有逻辑。
+}

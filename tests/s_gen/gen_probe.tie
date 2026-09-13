@@ -1,0 +1,140 @@
+type tie<logic>
+// tests/s_gen/gen_probe.tie —— p.9.5.1 生成器式协程运行期探针（惰性迭代/流）
+// 覆盖（全部断言，FAIL 即 exit(1)）：
+//   1. 有限惰性序列：counter(0,10,1) for 直接消费 → 0..9（逐元素产出，sum=45）
+//   2. 管道组合 + 惰性证明：take(map(counter(1,100000,1), count_map), 5) →
+//      {10,20,30,40,50}，且 map 只被调 5 次（不是 100000——惰性不一次性物化）
+//   3. 无限流截断取 N：take(infinite(0,1), 8) → 0..7（sum=28）
+//   4. 无限流 + 过滤管道：take(filter(infinite(0,1), even), 5) → 0,2,4,6,8，
+//      谓词恰 9 次（0..8 九候选即取满 5 偶，第 10 候选未触达——take 截断）
+//   5. 生成器互操作：tiec yield 生成器（急切攒表契约）经 from_table 惰性包装 →
+//      5,6,7；包装后接管道 take(map(...,add2),2) → 7,8；语言侧 for 直接消费
+//      生成器返回值（table<elem>）亦验
+//   6. 推导式消费协议对象： [v*2 for v in take(infinite(1,1),4)] → 2,4,6,8
+import "../../core/gen/tl_gen.tie"
+
+var g_map_calls: i64 = 0
+var g_filt_calls: i64 = 0
+
+func add2(x: i64) -> i64 {
+    return x + 2
+}
+func count_map(x: i64) -> i64 {
+    g_map_calls = g_map_calls + 1
+    return x * 10
+}
+func even(x: i64) -> bool {
+    g_filt_calls = g_filt_calls + 1
+    return x % 2 == 0
+}
+
+// tiec 生成器（p.9.11.15）：yield 标记生成器函数，签名返回类型登记 table<elem>
+// （当前语言侧契约 = 急切攒表返回；惰性由本运行期承载）。
+func gen_seq() -> i64 {
+    yield 5
+    yield 6
+    yield 7
+}
+
+func sum_stream(s: Stream) -> i64 {
+    var total: i64 = 0
+    for x in s {
+        total = total + x
+    }
+    return total
+}
+
+func main() {
+    println("== p.9.5.1 生成器式协程：惰性迭代/流探针 ==")
+    // ---- 1. 有限惰性序列 ----
+    var s1 = trm_lite_gen.counter(0, 10, 1)
+    var sum1 = sum_stream(s1)
+    println("[finite] sum=" + to_string(sum1))
+    if sum1 != 45 {
+        println("FAIL: counter(0,10,1) 之和应为 45")
+        exit(1)
+    }
+    // ---- 2. 管道 + 惰性证明 ----
+    g_map_calls = 0
+    var s2 = trm_lite_gen.take(trm_lite_gen.fmap(trm_lite_gen.counter(1, 100000, 1), count_map), 5)
+    var got2: table<i64> = []
+    for x in s2 {
+        table_push(got2, x)
+    }
+    var ok2: i64 = 1
+    var exp2: table<i64> = [10, 20, 30, 40, 50]
+    var i: i64 = 0
+    while i < 5 {
+        if got2[i] != exp2[i] {
+            ok2 = 0
+        }
+        i = i + 1
+    }
+    println("[pipe] got0=" + to_string(got2[0]) + " got4=" + to_string(got2[4]) + " map_calls=" + to_string(g_map_calls))
+    if ok2 != 1 || len(got2) != 5 {
+        println("FAIL: 管道输出应为 10,20,30,40,50")
+        exit(1)
+    }
+    if g_map_calls != 5 {
+        println("FAIL: 惰性未生效——map 应只被调 5 次（实际 " + to_string(g_map_calls) + "）")
+        exit(1)
+    }
+    // ---- 3. 无限流截断取 N ----
+    var s3 = trm_lite_gen.take(trm_lite_gen.infinite(0, 1), 8)
+    var sum3 = sum_stream(s3)
+    println("[infinite] sum=" + to_string(sum3))
+    if sum3 != 28 {
+        println("FAIL: take(infinite(0,1),8) 之和应为 28")
+        exit(1)
+    }
+    // ---- 4. 无限流 + 过滤管道 ----
+    g_filt_calls = 0
+    var s4 = trm_lite_gen.take(trm_lite_gen.filter(trm_lite_gen.infinite(0, 1), even), 5)
+    var sum4 = sum_stream(s4)
+    println("[inf+filter] sum=" + to_string(sum4) + " filt_calls=" + to_string(g_filt_calls))
+    if sum4 != 20 {
+        println("FAIL: take(filter(infinite,even),5) 之和应为 20")
+        exit(1)
+    }
+    if g_filt_calls != 9 {
+        println("FAIL: 谓词应恰 9 次（实际 " + to_string(g_filt_calls) + "）")
+        exit(1)
+    }
+    // ---- 5. 生成器互操作：from_table 惰性包装 yield 生成器 ----
+    var gt = gen_seq()
+    var s5 = trm_lite_gen.from_table(gt)
+    var sum5 = sum_stream(s5)
+    println("[gen] from_table sum=" + to_string(sum5))
+    if sum5 != 18 {
+        println("FAIL: from_table(gen_seq()) 之和应为 18")
+        exit(1)
+    }
+    var s6 = trm_lite_gen.take(trm_lite_gen.fmap(trm_lite_gen.from_table(gen_seq()), add2), 2)
+    var got6: table<i64> = []
+    for x in s6 {
+        table_push(got6, x)
+    }
+    println("[gen+pipe] got0=" + to_string(got6[0]) + " got1=" + to_string(got6[1]))
+    if got6[0] != 7 || got6[1] != 8 || len(got6) != 2 {
+        println("FAIL: from_table 下游管道应得 7,8")
+        exit(1)
+    }
+    // 语言侧契约：for 直接消费生成器返回值（table<elem>）
+    var sumg: i64 = 0
+    for y in gen_seq() {
+        sumg = sumg + y
+    }
+    println("[lang] for gen() sum=" + to_string(sumg))
+    if sumg != 18 {
+        println("FAIL: for 直接消费生成器返回值之和应为 18")
+        exit(1)
+    }
+    // ---- 6. 推导式消费协议对象 ----
+    var sq = [v * 2 for v in trm_lite_gen.take(trm_lite_gen.infinite(1, 1), 4)]
+    println("[comp] len=" + to_string(len(sq)) + " sq0=" + to_string(sq[0]) + " sq3=" + to_string(sq[3]))
+    if len(sq) != 4 || sq[0] != 2 || sq[3] != 8 {
+        println("FAIL: 推导式应得 2,4,6,8")
+        exit(1)
+    }
+    println("PASS: p.9.5.1 生成器式协程探针全部通过（流数=" + to_string(trm_lite_gen.stream_count()) + "）")
+}

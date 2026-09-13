@@ -1,0 +1,349 @@
+type tie<class>
+// core/gen/tl_gen.tie —— p.9.5.1 生成器式协程运行期：惰性迭代/流（trm-lite 侧）。
+// 定位：语言侧 yield（p.9.11.15，tiec f04962d）目前编译为「攒表返回」——生成器
+// 签名登记为 table<elem>，调用方得表，for 直接消费（急切物化、无运行期调用点）；
+// 惰性运行期契约 = p.9.11.16 迭代器协议（struct 实现 has_next/next 即可被
+// for/推导式消费分派）。本模块在该协议之上提供**惰性流**：
+//   · 惰性序列：counter/infinite 逐元素按需产出，不一次性物化；
+//   · 管道组合：fmap/filter/take 全部惰性（不产生中间表），管道末端 for 直接消费；
+//   · 无限流：infinite(lo, step) 无限产出，take 截断取 N；
+//   · 生成器互操作：from_table 惰性包装 tiec 生成器（yield）返回的表（句柄持有 +
+//     逐元素读取，下游管道不物化；源表本身由语言侧急切生成——契约如实记录）；
+//   · 多 worker 共享消费：pull/pull_id 原子拉取（锁内推进，p.9.5.2 迁移/窃取底座）。
+// 承载：注册表式流状态（全局平行表，id 1 起，0 号占位）+ 自有 CS 互斥
+// （Stream 值 = {id}，跨线程经注册表访问状态 → 挂起状态不绑定 worker，可随
+// 任务迁移/窃取）。for-in 协议（has_next/next）为**单消费者**契约；并发共享
+// 消费须用 pull/pull_id（has_next/next 两步在并发下无法构成原子对）。
+// 同步：tl_k32（CS）+ tl_tbl（from_table 句柄 retain）；表句柄布局遵循
+// tl_tbl（@8=len / @16=data / @24=esz，元素 i 在 data + i*esz）。
+import "../../core/mnn/tl_k32.tie"
+import "../../core/tbl/tl_tbl.tie"
+
+// ---------- 流状态注册表 ----------
+// 每个流 = 一行 {kind, a, b, c, tbl, child, pend, has}（i64 平行表）+ 映射/过滤
+// fn 槽（独立 fn 表，字面量建表防 esz 截断）。kind 编码：
+//   0=DONE（耗尽） 1=COUNTER[a=cur,b=hi,c=step] 2=INF[a=cur,c=step]
+//   3=TABLE[a=idx,tbl=句柄] 4=MAP[child,mapf] 5=FILTER[child,filt]
+//   6=TAKE[child,a=taken,b=limit]
+// 不设 const 全局（sched 同款纪律：文件级 const 以全局符号进 .o 成员，inline
+// import 程序与之重复定义）；kind 编码以注释契约固化。
+var g_g_init: i64 = 0
+var g_g_cs: i64 = 0                       // 流状态锁（CS 缓冲地址）
+var g_g_kind: table<i64>;                 // 流 kind（0 号占位）
+var g_g_a: table<i64>;
+var g_g_b: table<i64>;
+var g_g_c: table<i64>;
+var g_g_tbl: table<i64>;                  // TABLE 源表句柄（retain 持有）
+var g_g_child: table<i64>;                // 管道子流 id
+var g_g_pend: table<i64>;                 // 待取元素（has_next/pull 缓存）
+var g_g_has: table<i64>;                  // pend 有效标记
+var g_g_map: table<fn(i64) -> i64> = []     // MAP 变换 fn（0 号占位；ensure 建表）
+var g_g_filt: table<fn(i64) -> bool> = []   // FILTER 谓词 fn（0 号占位；ensure 建表）
+
+// 占位 fn（注册表 0 号槽；0 号流为 DONE，不会被拉取）。
+func gg_dummy_map(x: i64) -> i64 {
+    return 0
+}
+func gg_dummy_filt(x: i64) -> bool {
+    return false
+}
+
+// 惰性初始化（幂等）：流状态锁 + 平行表 + 0 号占位行。
+// trm_lite.a 静态链接时 main 不初始化库内表全局（@g = global ptr null），
+// 必须在桥函数首次调用时创建；import 内联时 main 已初始化，幂等无害。
+func gg_ensure() {
+    if g_g_init == 0 {
+        unsafe {
+            g_g_cs = ptr_to_int(alloc(64))
+            InitializeCriticalSection(g_g_cs)
+        }
+        g_g_kind = table_new_i64()
+        g_g_a = table_new_i64()
+        g_g_b = table_new_i64()
+        g_g_c = table_new_i64()
+        g_g_tbl = table_new_i64()
+        g_g_child = table_new_i64()
+        g_g_pend = table_new_i64()
+        g_g_has = table_new_i64()
+        // fn 表以**字面量**建（元素尺寸随类型推导：fn 元素 16B；table_new_i64
+        // esz=8 会截断 fn 值 → 表元素调用崩溃，p.9.5.x 同款纪律）
+        g_g_map = [gg_dummy_map]
+        g_g_filt = [gg_dummy_filt]
+        table_push(g_g_kind, 0)
+        table_push(g_g_a, 0)
+        table_push(g_g_b, 0)
+        table_push(g_g_c, 0)
+        table_push(g_g_tbl, 0)
+        table_push(g_g_child, 0)
+        table_push(g_g_pend, 0)
+        table_push(g_g_has, 0)
+        g_g_init = 1
+    }
+}
+
+// i64 → 指定地址逐字节读写（x64；对齐 sched wp_i64 / tl_tbl w_i64 模式）。
+// 名称前缀 gg_ 避免与同单元内联的 tl_tbl/sched 裸名辅助函数符号冲突。
+unsafe fn gg_w64(p: i64, off: i64, v: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        deref_write(int_to_ptr(p + off + k), (v >> (k * 8)) & 255)
+        k = k + 1
+    }
+}
+unsafe fn gg_r64(p: i64, off: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = deref(int_to_ptr(p + off + k))
+        v = v | (b << (k * 8))
+        k = k + 1
+    }
+    return v
+}
+
+// 新建流行，返回 id（1 起）。
+func gg_alloc(kind: i64) -> i64 {
+    gg_ensure()
+    var id = len(g_g_kind)
+    table_push(g_g_kind, kind)
+    table_push(g_g_a, 0)
+    table_push(g_g_b, 0)
+    table_push(g_g_c, 0)
+    table_push(g_g_tbl, 0)
+    table_push(g_g_child, 0)
+    table_push(g_g_pend, 0)
+    table_push(g_g_has, 0)
+    table_push(g_g_map, gg_dummy_map)
+    table_push(g_g_filt, gg_dummy_filt)
+    return id
+}
+
+// 锁内拉取：从流 id 推进一个元素到 g_g_pend[id] 并置 has；返回 1=有值 / 0=耗尽
+// （耗尽置 DONE）。递归拉取管道子流（深度 = 管道层数，受锁保护）。
+func gg_pull_locked(id: i64) -> i64 {
+    var k = g_g_kind[id]
+    if k == 1 {
+        // COUNTER [lo, hi) step
+        if g_g_a[id] < g_g_b[id] {
+            g_g_pend[id] = g_g_a[id]
+            g_g_a[id] = g_g_a[id] + g_g_c[id]
+            g_g_has[id] = 1
+            return 1
+        }
+        g_g_kind[id] = 0
+        return 0
+    }
+    if k == 2 {
+        // INF [lo, +∞) step
+        g_g_pend[id] = g_g_a[id]
+        g_g_a[id] = g_g_a[id] + g_g_c[id]
+        g_g_has[id] = 1
+        return 1
+    }
+    if k == 3 {
+        // TABLE：逐元素读取 tl_tbl 布局（len@8 / data@16 / esz@24）
+        var h = g_g_tbl[id]
+        unsafe {
+            var len = gg_r64(h, 8)
+            if g_g_a[id] < len {
+                var data = gg_r64(h, 16)
+                var esz = gg_r64(h, 24)
+                g_g_pend[id] = gg_r64(data + g_g_a[id] * esz, 0)
+                g_g_a[id] = g_g_a[id] + 1
+                g_g_has[id] = 1
+                return 1
+            }
+        }
+        g_g_kind[id] = 0
+        return 0
+    }
+    if k == 4 {
+        // MAP：child 拉一个 → 变换
+        var c = g_g_child[id]
+        if gg_pull_locked(c) == 1 {
+            g_g_pend[id] = g_g_map[id](g_g_pend[c])
+            g_g_has[c] = 0
+            g_g_has[id] = 1
+            return 1
+        }
+        g_g_kind[id] = 0
+        return 0
+    }
+    if k == 5 {
+        // FILTER：循环拉 child 直至谓词命中
+        var c = g_g_child[id]
+        while gg_pull_locked(c) == 1 {
+            var v = g_g_pend[c]
+            g_g_has[c] = 0
+            if g_g_filt[id](v) {
+                g_g_pend[id] = v
+                g_g_has[id] = 1
+                return 1
+            }
+        }
+        g_g_kind[id] = 0
+        return 0
+    }
+    if k == 6 {
+        // TAKE：截断前 b 个
+        var c = g_g_child[id]
+        if g_g_a[id] >= g_g_b[id] {
+            g_g_kind[id] = 0
+            return 0
+        }
+        if gg_pull_locked(c) == 1 {
+            g_g_pend[id] = g_g_pend[c]
+            g_g_has[c] = 0
+            g_g_a[id] = g_g_a[id] + 1
+            g_g_has[id] = 1
+            return 1
+        }
+        g_g_kind[id] = 0
+        return 0
+    }
+    return 0
+}
+
+// ---------- 惰性流（p.9.5.1） ----------
+// Stream = 可迭代协议对象（p.9.11.16）：struct 实现 has_next/next → for/推导式
+// 直接消费（while it.has_next() { x = it.next() }，接收者求值一次）。
+struct Stream {
+    var id: i64
+}
+
+namespace Stream {
+    // 单消费者协议：还有元素？（has 缓存命中直接 true，否则锁内拉取一个）
+    pub func has_next(self: Stream) -> bool {
+        gg_ensure()
+        var r: i64 = 0
+        unsafe {
+            EnterCriticalSection(g_g_cs)
+            if g_g_has[self.id] == 1 {
+                r = 1
+            } else {
+                r = gg_pull_locked(self.id)
+            }
+            LeaveCriticalSection(g_g_cs)
+        }
+        if r == 1 {
+            return true
+        }
+        return false
+    }
+    // 单消费者协议：取当前元素并推进（协议保证 has_next 后调用，pend 有效）。
+    pub func next(self: Stream) -> i64 {
+        gg_ensure()
+        unsafe {
+            EnterCriticalSection(g_g_cs)
+        }
+        var v = g_g_pend[self.id]
+        g_g_has[self.id] = 0
+        unsafe {
+            LeaveCriticalSection(g_g_cs)
+        }
+        return v
+    }
+}
+
+namespace trm_lite_gen {
+
+// 有限惰性序列 [lo, hi) 步长 step（hi ≤ lo 立即空）。
+pub func counter(lo: i64, hi: i64, step: i64) -> Stream {
+    var id = gg_alloc(1)
+    g_g_a[id] = lo
+    g_g_b[id] = hi
+    g_g_c[id] = step
+    var s: Stream = Stream()
+    s.id = id
+    return s
+}
+
+// 无限惰性流 [lo, +∞) 步长 step（配合 take 截断取 N）。
+pub func infinite(lo: i64, step: i64) -> Stream {
+    var id = gg_alloc(2)
+    g_g_a[id] = lo
+    g_g_c[id] = step
+    var s: Stream = Stream()
+    s.id = id
+    return s
+}
+
+// 惰性包装生成器/既有表：句柄 retain 持有 + 逐元素读取（下游管道惰性，不复制）。
+// 源表由语言侧 yield 生成器（p.9.11.15 急切攒表）或用户提供；表须存活于流
+// 消费期间（retain 保证——流注册表长期持有，进程退出回收）。
+pub func from_table(t: table<i64>) -> Stream {
+    var id = gg_alloc(3)
+    unsafe {
+        var h = ptr_to_int(t)
+        g_g_tbl[id] = h
+        tl_tbl.tbl_retain(h)
+    }
+    var s: Stream = Stream()
+    s.id = id
+    return s
+}
+
+// 惰性映射：child 每元素经 f 变换（f 每次迭代调用一次，不物化中间表）。
+// 命名 fmap：`map` 为 tie 保留字（map 类型关键字），不可作成员名。
+pub func fmap(s: Stream, f: fn(i64) -> i64) -> Stream {
+    var id = gg_alloc(4)
+    g_g_child[id] = s.id
+    g_g_map[id] = f
+    var st: Stream = Stream()
+    st.id = id
+    return st
+}
+
+// 惰性过滤：child 元素经 p 谓词筛选（p 每候选调用一次，跳过不满足者）。
+pub func filter(s: Stream, p: fn(i64) -> bool) -> Stream {
+    var id = gg_alloc(5)
+    g_g_child[id] = s.id
+    g_g_filt[id] = p
+    var st: Stream = Stream()
+    st.id = id
+    return st
+}
+
+// 惰性截断：取 child 前 n 个（n ≤ 0 立即空）。
+pub func take(s: Stream, n: i64) -> Stream {
+    var id = gg_alloc(6)
+    g_g_child[id] = s.id
+    g_g_a[id] = 0
+    g_g_b[id] = n
+    var st: Stream = Stream()
+    st.id = id
+    return st
+}
+
+// ---------- p.9.5.2 原子拉取（多 worker 共享消费） ----------
+// 锁内推进一个元素并写 out（i64 地址，x64 ABI 逐字节）；返回 1=有值 / 0=耗尽。
+// 任意 worker 可调——流状态在全局注册表（不绑定 worker），挂起状态随任务经
+// S-deque 迁移/窃取而不破坏惰性语义（每个元素恰被交付一次）。
+pub func pull(s: Stream, out: i64) -> i64 {
+    return pull_id(s.id, out)
+}
+pub func pull_id(id: i64, out: i64) -> i64 {
+    gg_ensure()
+    var r: i64 = 0
+    unsafe {
+        EnterCriticalSection(g_g_cs)
+        r = gg_pull_locked(id)
+        if r == 1 {
+            gg_w64(out, 0, g_g_pend[id])
+            g_g_has[id] = 0
+        }
+        LeaveCriticalSection(g_g_cs)
+    }
+    return r
+}
+
+// 观测：注册表流数（id 上界 - 1；探针/调试用）。
+pub func stream_count() -> i64 {
+    gg_ensure()
+    return len(g_g_kind) - 1
+}
+
+pub func module_version() -> string {
+    return "0.1.0"
+}
+}
