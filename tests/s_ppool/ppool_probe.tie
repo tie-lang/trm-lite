@@ -1,0 +1,148 @@
+type tie<logic>
+// tests/s_ppool/ppool_probe.tie —— p.9.5.x 并行池 API（trm_lite_ppool）探针
+// 覆盖：
+//   1. 多任务并行执行正确性：8 个任务各累加独立计数器 g_cnt[i]（i64 槽零竞争）、
+//      结果表逐项精确（res[i] == i*(i+1)+1）；
+//   2. 并行度生效：每任务 Sleep(30ms) 制造执行窗口——8×30ms 串行 ≥240ms，
+//      2 worker 池下任务必然分派到 ≥2 个 worker（pp_worker_runs 观测断言）；
+//   3. 重复提交复用池：批次 2 复用同一池——线程数不增长、wrun 跨批累计；
+//   4. void 任务：pp_submit_void 计数正确。
+// 构建约束：import sched（含 trm_lite_ppool）+ tl_tbl（内联桥）→ tbl_inlined_check
+// 命中 → 编译器不追加 trm_lite.a → 单对象自包含、零链接期重复符号。
+import "../../core/mnn/sched.tie"
+import "../../core/tbl/tl_tbl.tie"
+
+var g_cnt: table<i64> = []
+
+func main() {
+    println("== trm-lite 并行池 API 探针（p.9.5.x）==")
+    g_cnt = table_new_i64()
+    var k: i64 = 0
+    while k < 16 {
+        table_push(g_cnt, 0)
+        k = k + 1
+    }
+    // ---- 开池：并行度 2（常驻 worker，跨提交复用）----
+    var r = trm_lite_ppool.pp_open(2)
+    println("[open] r=" + to_string(r) + " workers=" + to_string(trm_lite_ppool.pp_workers()))
+    if r != 1 {
+        println("FAIL: pp_open 应新建池 (r=1)")
+        exit(1)
+    }
+    // ---- 批次 1：8 个 i64 任务（独立计数器 + 结果表精确 + 并行度观测）----
+    var fs: table<fn() -> i64> = []
+    var i: i64 = 0
+    while i < 8 {
+        var iv = i
+        var iv2 = i + 1
+        table_push(fs, func() -> i64 {
+            g_cnt[iv] = g_cnt[iv] + 1
+            unsafe {
+                Sleep(30)
+            }
+            return iv * iv2 + 1
+        })
+        i = i + 1
+    }
+    var res: table<i64> = table_new_i64()
+    var done = trm_lite_ppool.pp_submit(fs, 8, res)
+    println("[batch1] done=" + to_string(done) + " res_len=" + to_string(len(res)))
+    if done != 8 || len(res) != 8 {
+        println("FAIL: 批次1 完成数/结果数应为 8")
+        exit(1)
+    }
+    i = 0
+    while i < 8 {
+        if g_cnt[i] != 1 {
+            println("FAIL: 计数器 g_cnt[" + to_string(i) + "]=" + to_string(g_cnt[i]) + " 应为 1")
+            exit(1)
+        }
+        var exp = i * (i + 1) + 1
+        if res[i] != exp {
+            println("FAIL: 结果 res[" + to_string(i) + "]=" + to_string(res[i]) + " 应为 " + to_string(exp))
+            exit(1)
+        }
+        i = i + 1
+    }
+    // 并行度生效：2 worker 池 × 8 个 30ms 任务 → 两个 worker 都必须实际执行过任务
+    var wr0 = trm_lite_ppool.pp_worker_runs(0)
+    var wr1 = trm_lite_ppool.pp_worker_runs(1)
+    println("[parallel] runs(w0)=" + to_string(wr0) + " runs(w1)=" + to_string(wr1))
+    if wr0 < 1 || wr1 < 1 {
+        println("FAIL: 并行度未生效——任务未分派到多个 worker")
+        exit(1)
+    }
+    if wr0 + wr1 != 8 {
+        println("FAIL: worker 执行总数应为 8")
+        exit(1)
+    }
+    // ---- 批次 2：重复提交复用池（线程数不增长；wrun 跨批累计）----
+    var fs2: table<fn() -> i64> = []
+    i = 0
+    while i < 4 {
+        var iv = i
+        table_push(fs2, func() -> i64 {
+            g_cnt[iv + 8] = g_cnt[iv + 8] + 1
+            return iv + 100
+        })
+        i = i + 1
+    }
+    var res2: table<i64> = table_new_i64()
+    var done2 = trm_lite_ppool.pp_submit(fs2, 4, res2)
+    var tc = trm_lite_ppool.pp_thread_count()
+    var wr0b = trm_lite_ppool.pp_worker_runs(0)
+    var wr1b = trm_lite_ppool.pp_worker_runs(1)
+    println("[batch2] done=" + to_string(done2) + " threads=" + to_string(tc) +
+        " runs(w0,w1)=" + to_string(wr0b) + "," + to_string(wr1b))
+    if done2 != 4 || tc != 2 {
+        println("FAIL: 批次2 完成数应为 4、线程数应保持 2（复用池）")
+        exit(1)
+    }
+    if wr0b < wr0 || wr1b < wr1 {
+        println("FAIL: wrun 应跨批累计（池复用）")
+        exit(1)
+    }
+    if wr0b + wr1b != 12 {
+        println("FAIL: worker 执行总数应为 12（8+4）")
+        exit(1)
+    }
+    i = 0
+    while i < 4 {
+        if g_cnt[i + 8] != 1 {
+            println("FAIL: 批次2 计数器 g_cnt[" + to_string(i + 8) + "]=" + to_string(g_cnt[i + 8]) + " 应为 1")
+            exit(1)
+        }
+        if res2[i] != i + 100 {
+            println("FAIL: 批次2 结果 res2[" + to_string(i) + "]=" + to_string(res2[i]) + " 应为 " + to_string(i + 100))
+            exit(1)
+        }
+        i = i + 1
+    }
+    // ---- void 任务：pp_submit_void ----
+    var fsv: table<fn() -> void> = []
+    i = 0
+    while i < 3 {
+        var iv = i
+        table_push(fsv, func() {
+            g_cnt[iv + 12] = g_cnt[iv + 12] + 5
+        })
+        i = i + 1
+    }
+    var donev = trm_lite_ppool.pp_submit_void(fsv, 3)
+    println("[void] done=" + to_string(donev))
+    if donev != 3 {
+        println("FAIL: void 提交完成数应为 3")
+        exit(1)
+    }
+    i = 0
+    while i < 3 {
+        if g_cnt[i + 12] != 5 {
+            println("FAIL: void 计数器 g_cnt[" + to_string(i + 12) + "]=" + to_string(g_cnt[i + 12]) + " 应为 5")
+            exit(1)
+        }
+        i = i + 1
+    }
+    // ---- 停池（幂等）----
+    trm_lite_ppool.pp_close()
+    println("PASS: 并行池 API 探针全部通过")
+}

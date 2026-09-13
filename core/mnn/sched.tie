@@ -75,6 +75,38 @@ func tl_sched_ensure() {
     }
 }
 
+// ---------- p.9.5.x 并行池（trm_lite_ppool）：显式并行任务池 ----------
+// 与 actor 单消费者串行语义正交：批量提交 fn() -> i64 / fn() -> void 任务，
+// 池内 worker 线程并行执行、全部完成后返回结果表/计数；并行度（worker 数）
+// 可配置、池常驻可跨提交复用（生命周期独立于单次提交）。
+// 承载：**直接复用 S-pool 底座（不另起线程模型）**——
+//   · 任务经 trm_lite_sched.spawn_task 入 S-deque（entry 槽存并行池注册表下标、
+//     env=0、retcode 沿用 0=i64/1=void 编码）→ 轮转分发 + 窃取 + 溢出全复用；
+//   · 库侧发射常驻 worker（pp_worker：CreateThread + cb_ptr，与编译器生成的
+//     tie_s_pool_worker 同语义——pop_task → 执行 → task_done → 调度点让出 →
+//     空队限时等待），pop_task/task_done/yield_wait/pool_idle_wait/after_task
+//     等原语全复用；
+//   · 注册表（fn 值）/结果槽/每 worker 执行计数为并行池自有平行数组，下标 1 起
+//     （0 号占位：pop_task 以 0 表示空队，任务下标不得为 0）。
+// 全局名前缀 g_pp_：避免与复杂形态 sched_ws 内联同名全局（g_regs/g_items 等）
+// 及用户程序全局的裸名冲突（p.6.7.7 同款纪律）。
+var g_pp_cs: i64 = 0                // 并行池状态锁（up/shut/线程句柄表临界区）
+var g_pp_init: i64 = 0              // 惰性初始化标记
+var g_pp_up: i64 = 0                // 池已启动（worker 线程存活）
+var g_pp_shut: i64 = 0              // 停机标记（worker 空队时见 1 退出）
+var g_pp_t64: table<fn() -> i64> = []  // i64 任务注册表（0 号占位）
+var g_pp_tv: table<fn() -> void> = []  // void 任务注册表（0 号占位）
+var g_pp_res: table<i64> = []       // 每任务结果槽（i64 任务返回值；0 号占位）
+var g_pp_wrun: table<i64> = []      // 每 worker 累计执行任务数（并行度观测）
+var g_pp_ths: table<i64> = []       // worker 线程句柄表
+
+// 占位任务（注册表 0 号槽；worker 实际取不到——pop_task 返回 0 即空队）。
+func pp_dummy_i64() -> i64 {
+    return 0
+}
+func pp_dummy_void() {
+}
+
 namespace trm_lite_sched {
 
 pub func set_workers(m: i64) {
@@ -91,7 +123,9 @@ pub func workers() -> i64 {
 // 竞态论证：段表由 main 侧首个 spawn 前的 pool_sync_ensure 一次性创建（此后
 // g_deque_init==1），worker 线程在首个 spawn 之后才由编译器建出——不存在两个
 // 线程同时看到 g_deque_init==0 的窗口（与 g_pool_ready 同论证）。
-func pool_sync_ensure() {
+// p.9.5.x：并行池在首个 spawn 前发射 worker——pp_open 建线程前由调用线程先行
+// 调用本函数（pub 导出），其后 worker 侧调用均为幂等空转。
+pub func pool_sync_ensure() {
     if g_pool_ready == 0 {
         unsafe {
             g_cs_s = ptr_to_int(alloc(64))
@@ -473,6 +507,253 @@ pub func stolen_count() -> i64 {
 
 pub func module_version() -> string {
     return TRM_LITE_SCHED_VERSION
+}
+}
+
+// ---------- p.9.5.x 并行池 worker（库侧发射；与编译器 tie_s_pool_worker 同语义） ----------
+// 循环：pop_task 抢任务（S-deque 轮转/窃取/溢出全复用）→ 按 retcode 执行注册表
+// fn 值（i64 任务写结果槽）→ wrun 计数 → task_done → 调度点让出；空队限时等待
+// （pool_idle_wait），见 g_pp_shut 退出（pp_close join）。
+func pp_worker(me: i64) -> i64 {
+    var eo: i64 = 0
+    var ro: i64 = 0
+    unsafe {
+        eo = ptr_to_int(alloc(8))
+        ro = ptr_to_int(alloc(8))
+    }
+    var last: i64 = 0
+    while 1 {
+        var e = trm_lite_sched.pop_task(me, eo, ro)
+        if e != 0 {
+            var rc: i64 = 0
+            unsafe {
+                rc = deref(int_to_ptr(ro))
+            }
+            if rc == 0 {
+                g_pp_res[e] = g_pp_t64[e]()
+            } else {
+                g_pp_tv[e]()
+            }
+            g_pp_wrun[me] = g_pp_wrun[me] + 1
+            trm_lite_sched.task_done()
+            var gy = trm_lite_sched.after_task(me)
+            if gy == 1 {
+                trm_lite_sched.pool_give_wait()
+            }
+        } else {
+            var ex: i64 = 0
+            unsafe {
+                EnterCriticalSection(g_pp_cs)
+                if g_pp_shut == 1 {
+                    ex = 1
+                }
+                LeaveCriticalSection(g_pp_cs)
+            }
+            if ex == 1 {
+                return last
+            }
+            trm_lite_sched.pool_idle_wait()
+        }
+    }
+}
+
+namespace trm_lite_ppool {
+
+// 惰性初始化（幂等）：状态锁 + 注册表/结果槽/执行计数/线程句柄平行数组 + 0 号占位。
+// 表以**字面量**创建（元素尺寸随类型推导：fn 元素 16B、i64 元素 8B）——绝不可用
+// table_new_i64()（esz=8，fn 值截断 → 表元素调用崩溃，p.9.5.x 实测 0xC0000005）。
+pub func ensure() {
+    if g_pp_init == 0 {
+        unsafe {
+            g_pp_cs = ptr_to_int(alloc(64))
+            InitializeCriticalSection(g_pp_cs)
+        }
+        g_pp_t64 = [pp_dummy_i64]
+        g_pp_tv = [pp_dummy_void]
+        g_pp_res = [0]
+        g_pp_wrun = []
+        g_pp_ths = []
+        g_pp_init = 1
+    }
+}
+
+// 开池：置并行度（worker 数，≥1）+ 库侧发射常驻 worker（复用 S-pool 底座）。
+// 返回 1=新建 / 0=已开复用 / -1=参数非法。并行度须在首个任务入队前设置
+// （与 S-pool set_workers 同约束：S-deque 段表按 P 惰性构建）。
+pub func pp_open(workers: i64) -> i64 {
+    ensure()
+    if workers < 1 {
+        return -1
+    }
+    var up: i64 = 0
+    unsafe {
+        EnterCriticalSection(g_pp_cs)
+        if g_pp_up == 1 {
+            up = 1
+        } else {
+            g_pp_shut = 0
+        }
+        LeaveCriticalSection(g_pp_cs)
+    }
+    if up == 1 {
+        return 0
+    }
+    trm_lite_sched.set_workers(workers)
+    var P = trm_lite_sched.pool_workers()
+    // 关键：建线程前由调用线程（单线程）完成 S-pool 同步状态/段表惰性初始化。
+    // pool_sync_ensure 的 g_pool_ready/g_sdq_init 守卫无锁——原设计假设 worker
+    // 在首个 spawn 之后才建出（main 已初始化）；并行池在首个 spawn 前发射 worker，
+    // 若放任两个 worker 并发首次调用 → 双重初始化 CS/CV/段表 → 偶发死锁（p.9.5.x
+    // 实测挂起）。此处先行初始化后，worker 的 pool_sync_ensure 均为幂等空转。
+    trm_lite_sched.pool_sync_ensure()
+    // 预置 wrun 观测槽（P 个 0）：tie 表越界写静默丢弃（tl_tbl ok=0），
+    // 必须先建槽再按 me 下标自增。池已关再开时 wrun 累计值保留（len>0 不重推）。
+    if len(g_pp_wrun) == 0 {
+        var wi: i64 = 0
+        while wi < P {
+            table_push(g_pp_wrun, 0)
+            wi = wi + 1
+        }
+    }
+    var i: i64 = 0
+    while i < P {
+        var th: i64 = 0
+        unsafe {
+            th = CreateThread(0, 0, cb_ptr(pp_worker), i, 0, 0)
+        }
+        table_push(g_pp_ths, th)
+        i = i + 1
+    }
+    unsafe {
+        EnterCriticalSection(g_pp_cs)
+        g_pp_up = 1
+        LeaveCriticalSection(g_pp_cs)
+    }
+    return 1
+}
+
+// 当前并行度（worker 数）。
+pub func pp_workers() -> i64 {
+    ensure()
+    return trm_lite_sched.pool_workers()
+}
+
+// 提交 n 个 fn() -> i64 任务：池内并行执行、阻塞至全部完成，结果按序追加进
+// res（调用方提供的 table<i64> 句柄），返回实际完成数 min(n, len(fs))。
+pub func pp_submit(fs: table<fn() -> i64>, n: i64, res: table<i64>) -> i64 {
+    ensure()
+    var m = n
+    var fl = len(fs)
+    if m > fl {
+        m = fl
+    }
+    if m < 1 {
+        return 0
+    }
+    var up: i64 = 0
+    unsafe {
+        EnterCriticalSection(g_pp_cs)
+        up = g_pp_up
+        LeaveCriticalSection(g_pp_cs)
+    }
+    if up == 0 {
+        pp_open(trm_lite_sched.pool_workers())
+    }
+    var base = len(g_pp_res)
+    var i: i64 = 0
+    while i < m {
+        var idx = len(g_pp_t64)
+        table_push(g_pp_t64, fs[i])
+        table_push(g_pp_tv, pp_dummy_void)
+        table_push(g_pp_res, 0)
+        trm_lite_sched.spawn_task(idx, 0, 0)
+        i = i + 1
+    }
+    trm_lite_sched.yield_wait()
+    i = 0
+    while i < m {
+        table_push(res, g_pp_res[base + i])
+        i = i + 1
+    }
+    return m
+}
+
+// 提交 n 个 fn() -> void 任务：并行执行并阻塞至全部完成，返回完成数。
+pub func pp_submit_void(fs: table<fn() -> void>, n: i64) -> i64 {
+    ensure()
+    var m = n
+    var fl = len(fs)
+    if m > fl {
+        m = fl
+    }
+    if m < 1 {
+        return 0
+    }
+    var up: i64 = 0
+    unsafe {
+        EnterCriticalSection(g_pp_cs)
+        up = g_pp_up
+        LeaveCriticalSection(g_pp_cs)
+    }
+    if up == 0 {
+        pp_open(trm_lite_sched.pool_workers())
+    }
+    var i: i64 = 0
+    while i < m {
+        var idx = len(g_pp_t64)
+        table_push(g_pp_t64, pp_dummy_i64)
+        table_push(g_pp_tv, fs[i])
+        table_push(g_pp_res, 0)
+        trm_lite_sched.spawn_task(idx, 0, 1)
+        i = i + 1
+    }
+    trm_lite_sched.yield_wait()
+    return m
+}
+
+// 观测：worker w 累计执行任务数（跨提交累计；并行度生效核验）。
+pub func pp_worker_runs(w: i64) -> i64 {
+    ensure()
+    if w < 0 || w >= len(g_pp_wrun) {
+        return 0
+    }
+    return g_pp_wrun[w]
+}
+
+// 观测：常驻 worker 线程数（= 并行度；重复提交不增长）。
+pub func pp_thread_count() -> i64 {
+    ensure()
+    return len(g_pp_ths)
+}
+
+// 停池：置停机标记 + join 全部 worker（worker 空队限时醒后见标记退出）；幂等。
+pub func pp_close() {
+    ensure()
+    var up: i64 = 0
+    unsafe {
+        EnterCriticalSection(g_pp_cs)
+        if g_pp_up == 1 {
+            g_pp_shut = 1
+            up = 1
+        }
+        LeaveCriticalSection(g_pp_cs)
+    }
+    if up == 1 {
+        var i: i64 = 0
+        while i < len(g_pp_ths) {
+            unsafe {
+                WaitForSingleObject(g_pp_ths[i], 3000)
+                CloseHandle(g_pp_ths[i])
+            }
+            i = i + 1
+        }
+        g_pp_ths = table_new_i64()
+        unsafe {
+            EnterCriticalSection(g_pp_cs)
+            g_pp_up = 0
+            LeaveCriticalSection(g_pp_cs)
+        }
+    }
 }
 }
 

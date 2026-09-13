@@ -1,6 +1,6 @@
 # trm-lite — tie 平台的 Go 式静态内置运行时
 
-> 状态：**preview.3**（p.6.5 完成：复杂形态 work-stealing 调度 + 并发三色 GC（分代/整理）+ 可迁移栈 + channel 语言原语 + actor mailbox 咬合；p.6.7 完成：双形态并行体系——S-deque 窃取/C-pool 常驻池/C-deque per-P 细锁/协作抢占统一/WaitGroup/channel Go 语义（close 广播 + select）双形态验收矩阵全绿）
+> 状态：**preview.3**（p.6.5 完成：复杂形态 work-stealing 调度 + 并发三色 GC（分代/整理）+ 可迁移栈 + channel 语言原语 + actor mailbox 咬合；p.6.7 完成：双形态并行体系——S-deque 窃取/C-pool 常驻池/C-deque per-P 细锁/协作抢占统一/WaitGroup/channel Go 语义（close 广播 + select）双形态验收矩阵全绿；p.9.5.x 完成：显式并行池 API `trm_lite_ppool`——批量 fn 任务池，复用 S-pool 底座，并行度可配、跨提交复用，与 actor 单消费者语义正交）
 
 trm-lite 为 tie 引入 **Go 式静态内置 runtime** 形态，对标 Go 把调度器/GC 以库形式**静态链接**进单一零依赖二进制。与 trm（字节码 VM，路线 B）**并行开发、互不干扰**。
 
@@ -66,6 +66,73 @@ tiec spawn_demo.tie -o spawn_demo.exe
 - `wg_new() -> i64` / `wg_add(h, n)` / `wg_done(h)` / `wg_wait(h)` / `wg_count(h)`：
   结构化并发 WaitGroup（Go sync.WaitGroup 语义，done 归零广播；p.6.7.11；
   复杂形态 `ctx_wg_*` 语义一致）。
+
+## 并行池 API（p.9.5.x：trm_lite_ppool，显式并行任务池）
+
+面向**纯并行任务**的显式批处理池（与 actor 单消费者串行语义正交）：批量提交
+`fn() -> i64` / `fn() -> void` 任务，池内 worker 线程并行执行、全部完成后返回
+结果表/计数。**直接复用 S-pool 底座**（同一 S-deque 轮转/窃取/溢出、同一
+CS/CV 同步、同语义 worker 循环——库侧发射，不另起线程模型）；并行度可配置、
+池常驻可跨提交复用（生命周期独立于单次提交）。
+
+通过 `import` 使用（内联 S-pool + tl_tbl 桥，单对象自包含，不触发 trm_lite.a
+重复链接）：
+
+```tie
+type tie<logic>
+import "../../trm-lite/core/mnn/sched.tie"
+import "../../trm-lite/core/tbl/tl_tbl.tie"
+
+var g_cnt: table<i64> = []
+
+func main() {
+    g_cnt = table_new_i64()
+    var k: i64 = 0
+    while k < 4 {
+        table_push(g_cnt, 0)
+        k = k + 1
+    }
+    var r = trm_lite_ppool.pp_open(2)         // 开池：并行度 2（常驻 worker）
+    var fs: table<fn() -> i64> = []
+    var i: i64 = 0
+    while i < 4 {
+        var iv = i
+        table_push(fs, func() -> i64 {        // 任务闭包（按需捕获下标）
+            g_cnt[iv] = g_cnt[iv] + 1
+            return iv * iv + 1
+        })
+        i = i + 1
+    }
+    var res: table<i64> = []
+    var done = trm_lite_ppool.pp_submit(fs, 4, res)   // 并行执行 + 同步屏障
+    trm_lite_ppool.pp_close()                 // 停池（join worker，幂等）
+    println("done=" + to_string(done) + " res0=" + to_string(res[0]))
+}
+```
+
+API（`namespace trm_lite_ppool`，实现于 `core/mnn/sched.tie`）：
+
+- `pp_open(workers) -> i64`：开池——置并行度（worker 数，≥1）+ 库侧发射常驻
+  worker（CreateThread + cb_ptr，worker 循环与编译器 `tie_s_pool_worker` 同语义：
+  pop_task → 执行 → task_done → 调度点让出 → 空队限时等待）。返回 1=新建 /
+  0=已开复用 / -1=参数非法。并行度须在首个提交前设置（S-deque 段表按 P 惰性
+  构建）。p.9.5.x：建线程前由调用线程先行 `pool_sync_ensure`——S-pool 惰性
+  初始化守卫无锁，原设计假设 worker 在首个 spawn 后建出；并行池在首个 spawn
+  前发射 worker，须先初始化防并发双重初始化死锁。
+- `pp_workers() -> i64`：当前并行度。
+- `pp_submit(fs: table<fn() -> i64>, n, res: table<i64>) -> i64`：提交 n 个
+  i64 任务（结果按序追加进 res），**阻塞至全部完成**，返回完成数 min(n, len(fs))。
+- `pp_submit_void(fs: table<fn() -> void>, n) -> i64`：提交 n 个 void 任务，
+  阻塞至全部完成，返回完成数。
+- `pp_worker_runs(w) -> i64`：观测——worker w 累计执行任务数（跨提交累计，
+  并行度生效核验）。
+- `pp_thread_count() -> i64`：观测——常驻 worker 线程数（= 并行度；重复提交
+  不增长）。
+- `pp_close()`：停池——置停机标记 + join 全部 worker（幂等）。
+
+验收载体：`tests/s_ppool/ppool_probe.tie`（多任务独立计数器 + 结果表精确、
+并行度生效（≥2 worker 实际分派）、重复提交复用池、void 任务；20 次压力
+PASS、exit 0）。
 
 验收载体：`tests/s10_exec/`（`spawn_demo`/`spawn_void_demo`/`closure_spawn_demo` 内置验收；
 阶段 1 的 `exec_demo` 轻量执行体内核探针已随 p.6.7.6 S-pool 取代旧内核而移除）。
