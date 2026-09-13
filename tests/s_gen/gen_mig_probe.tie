@@ -1,0 +1,137 @@
+type tie<logic>
+// tests/s_gen/gen_mig_probe.tie —— p.9.5.2 生成器任务迁移/窃取探针
+// 覆盖（全部断言，FAIL 即 exit(1)）：
+//   1. 惰性管道流（无限源 → take 512 → filter 偶 → fmap 半 → take 64，期望
+//      0..63 精确序列）由 8 个任务经并行池 2 worker **共享并发消费**：
+//      pull_id 原子拉取（锁内推进）→ 每个值恰被交付一次 → 无重复无遗漏；
+//   2. 生成器挂起状态在全局注册表（不绑定 worker）→ 任务被 S-deque 窃取/
+//      迁移后继续消费同一流不破坏惰性语义（exact total=64 且每槽恰 1）；
+//   3. 多 worker 生效：pp_worker_runs ≥ 1（任务实际分派到两个 worker；
+//      stolen_count 观测——S-deque 他段/溢出被取走次数）；
+//   4. 池复用 + 第二批新流（take(infinite,100)）再验精确消费 0..99。
+import "../../core/mnn/sched.tie"
+import "../../core/gen/tl_gen.tie"
+
+var g_rec: table<i64> = []
+
+func even(x: i64) -> bool {
+    return x % 2 == 0
+}
+func half(x: i64) -> i64 {
+    return x / 2
+}
+
+// 共享消费一轮：8 任务各拉取共享流直至耗尽，逐值登记（每值恰被一任务写入
+// g_rec 槽——pull 原子性保证，槽间零竞争）。返回提交任务数。
+func consume_round(gid: i64, n: i64, base: i64) -> i64 {
+    var fs: table<fn() -> i64> = []
+    var i: i64 = 0
+    while i < 8 {
+        var iv = i
+        var ivb = base
+        table_push(fs, func() -> i64 {
+            var vo: i64 = 0
+            unsafe {
+                vo = ptr_to_int(alloc(8))
+                // 错峰：奇数号任务起始让出 60ms（偶数号立即）——偶数段 worker
+                // 先清空自段 → 空窗期从他段头窃取 → stolen 观测非零
+                Sleep((iv % 2) * 60)
+            }
+            while 1 {
+                var got = trm_lite_gen.pull_id(gid, vo)
+                if got == 0 {
+                    break
+                }
+                var v: i64 = 0
+                unsafe {
+                    v = deref(int_to_ptr(vo))
+                    Sleep(1)
+                }
+                g_rec[ivb + v] = g_rec[ivb + v] + 1
+            }
+            return 0
+        })
+        i = i + 1
+    }
+    var res: table<i64> = table_new_i64()
+    return trm_lite_ppool.pp_submit(fs, n, res)
+}
+
+func main() {
+    println("== p.9.5.2 生成器任务迁移/窃取探针 ==")
+    var r = trm_lite_ppool.pp_open(2)
+    if r != 1 {
+        println("FAIL: pp_open 应新建池")
+        exit(1)
+    }
+    // ---- 批次 1：惰性管道流（0..63）多 worker 共享消费 ----
+    var g1 = trm_lite_gen.take(trm_lite_gen.fmap(trm_lite_gen.filter(trm_lite_gen.take(trm_lite_gen.infinite(0, 1), 512), even), half), 64)
+    g_rec = table_new_i64()
+    var k: i64 = 0
+    while k < 128 {
+        table_push(g_rec, 0)
+        k = k + 1
+    }
+    var done1 = consume_round(g1.id, 8, 0)
+    var total1: i64 = 0
+    var bad1: i64 = 0
+    k = 0
+    while k < 64 {
+        if g_rec[k] != 1 {
+            bad1 = bad1 + 1
+        }
+        total1 = total1 + g_rec[k]
+        k = k + 1
+    }
+    var wr0 = trm_lite_ppool.pp_worker_runs(0)
+    var wr1 = trm_lite_ppool.pp_worker_runs(1)
+    var st1 = trm_lite_sched.stolen_count()
+    println("[b1] done=" + to_string(done1) + " total=" + to_string(total1) + " dup_or_miss=" + to_string(bad1) +
+        " runs=" + to_string(wr0) + "," + to_string(wr1) + " stolen=" + to_string(st1))
+    if done1 != 8 || total1 != 64 || bad1 != 0 {
+        println("FAIL: 批次1 多 worker 消费不精确（total=" + to_string(total1) + " dup=" + to_string(bad1) + "）")
+        exit(1)
+    }
+    if wr0 < 1 || wr1 < 1 {
+        println("FAIL: 批次1 任务未分派到多 worker（迁移/窃取未发生）")
+        exit(1)
+    }
+    if st1 < 1 {
+        println("FAIL: 批次1 未观测到 S-deque 窃取（stolen=" + to_string(st1) + "）")
+        exit(1)
+    }
+    // ---- 批次 2：池复用 + 新流 take(infinite(0,1),100) → 0..99 ----
+    // 重置登记表（批次 1 已写 0..63，须清槽再验 0..99 恰一）
+    g_rec = table_new_i64()
+    k = 0
+    while k < 100 {
+        table_push(g_rec, 0)
+        k = k + 1
+    }
+    var g2 = trm_lite_gen.take(trm_lite_gen.infinite(0, 1), 100)
+    var done2 = consume_round(g2.id, 8, 0)
+    var total2: i64 = 0
+    var bad2: i64 = 0
+    k = 0
+    while k < 100 {
+        if g_rec[k] != 1 {
+            bad2 = bad2 + 1
+        }
+        total2 = total2 + g_rec[k]
+        k = k + 1
+    }
+    var tc = trm_lite_ppool.pp_thread_count()
+    var st2 = trm_lite_sched.stolen_count()
+    println("[b2] done=" + to_string(done2) + " total=" + to_string(total2) + " dup_or_miss=" + to_string(bad2) +
+        " threads=" + to_string(tc) + " stolen=" + to_string(st2))
+    if done2 != 8 || total2 != 100 || bad2 != 0 {
+        println("FAIL: 批次2 多 worker 消费不精确（total=" + to_string(total2) + " dup=" + to_string(bad2) + "）")
+        exit(1)
+    }
+    if tc != 2 {
+        println("FAIL: 批次2 应复用池（线程数=2）")
+        exit(1)
+    }
+    trm_lite_ppool.pp_close()
+    println("PASS: p.9.5.2 生成器任务迁移/窃取探针全部通过")
+}
