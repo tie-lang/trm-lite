@@ -1,5 +1,42 @@
 # trm-lite 变更日志
 
+## r.1.6.7 — 2026-09-29
+
+- **表容器并发正确性回归探针 + 「esc 独占快路径」证伪回滚**。
+  - **新增 `tests/s_tbl/tl_tbl_conc_probe.tie`**：单线程 push/at 逐元素正确性 +
+    **多 worker（4）并发 push 同一张共享表 len 必须精确** + 元素值域完整性。
+    为加锁路径提供并发回归（该探针最初为验证 esc 快路径而写，回滚后保留其并发面）。
+  - **esc 独占快路径已实现→实测→回滚（不留代码）**：曾计划给句柄加
+    「是否已被复制」标志（esc@48，`tbl_retain` 置 1），esc==0 即免锁访问。
+    功能测试初看通过，但专门的 retain 插桩实验证明该判据**不充分**：
+    新建/局部赋值/全局赋值/闭包捕获四种动作下 esc 均按预期变化（插桩正常），
+    然而**表通过全局变量被多线程共享时不产生任何 retain** ⇒ esc 恒为 0
+    ⇒ 多 worker 全部走免锁路径 ⇒ **真实数据竞争**。
+    根因：**「句柄是否被复制」≠「表是否可能被并发访问」**——共享可经全局变量、
+    堆槽等路径发生且都不复制句柄，故**任何运行期「未逃逸」标志都无法覆盖**。
+    更安全的替代方向是**编译期逃逸分析**（见
+    `docs/2026-09-29-tie-perf-safety-and-startup.md` §3.3），后续单独立项。
+  - 回滚影响：`tl_tbl.tie` 恢复 r.1.6.6（句柄 48 字节、四入口直接加锁），
+    重建 `trm_lite.a` / `trm_lite_linux.a`，**并重新升格 tiec**
+    （tiec 链运行时库，不升格则竞态版会留在编译器二进制里），
+    新不动点 `8b5189c983437534`，s21 回归 158/8/2 与基线一致。
+
+  EN: r.1.6.7 — a table-container concurrency regression probe, plus the
+  falsification and rollback of the "esc exclusive fast path". The idea was to
+  give each handle a "has this been copied" flag (esc@48, set by `tbl_retain`) so
+  that esc==0 could skip locking. A dedicated retain-instrumentation experiment
+  showed the predicate is insufficient: the flag behaves correctly for a fresh
+  table, local assignment, global assignment and closure capture, but a table
+  shared **through a global variable** never triggers a retain, so esc stays 0
+  while several workers access it - a real data race. Root cause: whether the
+  handle was copied is not the same question as whether the table may be
+  accessed concurrently; sharing can happen through globals and heap slots
+  without copying the handle, so no run-time "has not escaped" flag can be
+  sound. The safer direction is compile-time escape analysis (see the perf
+  safety doc §3.3). Rolled back to r.1.6.6 semantics, rebuilt both runtime
+  libraries, re-promoted tiec (it links the runtime) with fixed point
+  8b5189c983437534, and s21 regression 158/8/2 matches the baseline.
+
 ## r.1.6.6 — 2026-09-29
 
 - **表容器热路径优化 + 批量原语（`core/tbl/tl_tbl.tie`）**。全部为**并发语义不变**

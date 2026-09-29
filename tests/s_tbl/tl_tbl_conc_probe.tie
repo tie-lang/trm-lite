@@ -1,0 +1,146 @@
+type tie<logic>
+// tests/s_tbl/tl_tbl_conc_probe.tie —— 表容器并发正确性验证
+// ---------------------------------------------------------------------------
+// 用途：
+//   1) 单线程正确性：逐元素 push/at 精确；
+//   2) **并发正确性**：多 worker 并发 push 同一张共享表，len 必须精确等于
+//      worker 数 × 每 worker 次数（无丢元素、无覆盖），且元素值域完整。
+// 第 2 条是核心：r.1.6.7 曾提出「esc 独占快路径」（免锁访问未逃逸表），
+// 经本探针与专门的 retain 插桩实验**证伪并回滚**（见
+// docs/2026-09-29-tie-perf-safety-and-startup.md「被实测推翻」节）——
+// 原因是表可经**全局变量/堆槽**被多线程共享而不触发任何 retain，运行期
+// 逃逸标志无法覆盖该场景。本探针保留为**加锁路径的并发回归**。
+// 构建约束：import sched（含 trm_lite_ppool）+ tl_tbl（内联桥）→ 单对象自包含。
+import "../../core/mnn/sched.tie"
+import "../../core/tbl/tl_tbl.tie"
+
+var g_shared: table<i64> = []   // 元素类型由标注决定（全局表初值须用字面量）
+var g_fails: i64 = 0
+
+// 逐元素读取（unsafe 集中在此）：返回 (ok, 值)。用于断言，不经表下标语法。
+unsafe func read_at(h: i64, i: i64) -> (i64, i64) {
+    var o = alloc(8)
+    var got = tl_tbl.tbl_at(h, i, ptr_to_int(o))
+    var v8 = deref(o)          // deref 为 ptr<u8> 单字节读
+    var v: i64 = to_i64(v8)    // 显式提宽（u8 → i64），保证元组两元素同为 i64
+    free(o)
+    return (got, v)
+}
+
+// 共享表值域覆盖测试用
+unsafe func mark_seen(h: i64, seen: table<i64>) -> i64 {
+    var p: i64 = 0
+    var cnt: i64 = 0
+    while p < tl_tbl.tbl_len(h) {
+        var (got, v) = read_at(h, p)
+        if got == 1 && v >= 0 && v < 256 {
+            seen[v] = 1
+            cnt = cnt + 1
+        }
+        p = p + 1
+    }
+    return cnt
+}
+
+func main() {
+    println("== 表容器并发正确性验证 ==")
+    var OWN: i64 = 4000
+    var W: i64 = 4
+    var PER: i64 = 2000
+
+    // ---- 1) 独占表：新建后从未复制（esc==0）⇒ 免锁路径，结果须精确 ----
+    var own = table_new_i64()
+    var i: i64 = 0
+    while i < OWN {
+        table_push(own, i & 0xFF)
+        i = i + 1
+    }
+    var own_ok: bool = len(own) == OWN
+    if own_ok {
+        var k2: i64 = 0
+        while k2 < OWN {
+            unsafe {
+                var (got, v) = read_at(ptr_to_int(own), k2)
+                if got != 1 || v != (k2 & 0xFF) {
+                    own_ok = false
+                }
+            }
+            k2 = k2 + 1
+        }
+    }
+    if own_ok {
+        println("PASS 单线程 push/at：len=" + to_string(len(own)) + " 逐元素正确")
+    } else {
+        println("FAIL 单线程 push/at 结果不正确：len=" + to_string(len(own)))
+        g_fails = g_fails + 1
+    }
+
+    // ---- 2) 共享表：赋值给全局 ⇒ 复制句柄（retain）⇒ esc==1 ⇒ 必须加锁 ----
+    // 若此断言失败（len < W*PER），即为 esc 判据漏锁的**实证**。
+    var r = trm_lite_ppool.pp_open(W)
+    if r != 1 {
+        println("FAIL pp_open")
+        g_fails = g_fails + 1
+    }
+    var fs: table<fn() -> i64> = []
+    var w: i64 = 0
+    while w < W {
+        table_push(fs, func() -> i64 {
+            var k: i64 = 0
+            while k < PER {
+                table_push(g_shared, k & 0xFF)
+                k = k + 1
+            }
+            // 交替读（与写的并发混合，暴露 as/len 竞态）
+            var j: i64 = 0
+            while j < 50 {
+                var dummy = len(g_shared)
+                j = j + 1
+            }
+            return 1
+        })
+        w = w + 1
+    }
+    var res: table<i64> = table_new_i64()
+    var done = trm_lite_ppool.pp_submit(fs, W, res)
+    trm_lite_ppool.pp_close()
+
+    var want = W * PER
+    if done == W && len(g_shared) == want {
+        println("PASS 共享表并发 push：len 精确 = " + to_string(want) + "（无丢元素）")
+    } else {
+        println("FAIL 共享表并发 push：len=" + to_string(len(g_shared)) +
+            " 期望 " + to_string(want) + "——数据竞争/丢元素")
+        g_fails = g_fails + 1
+    }
+
+    // ---- 3) 共享表并发「先写后读一致性」：所有写入值域覆盖全 0..255 ----
+    var seen = table_new_i64()
+    var s: i64 = 0
+    while s < 256 {
+        table_push(seen, 0)
+        s = s + 1
+    }
+    var dummy_cov: i64 = 0
+    unsafe {
+        dummy_cov = mark_seen(ptr_to_int(g_shared), seen)
+    }
+    var covered: i64 = 0
+    var q: i64 = 0
+    while q < 256 {
+        covered = covered + seen[q]
+        q = q + 1
+    }
+    if covered == 256 {
+        println("PASS 共享表元素值域完整（0..255 全覆盖）")
+    } else {
+        println("FAIL 共享表值域覆盖 " + to_string(covered) + "/256")
+        g_fails = g_fails + 1
+    }
+
+    if g_fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(g_fails))
+    }
+}
