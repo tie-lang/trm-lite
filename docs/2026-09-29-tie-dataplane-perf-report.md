@@ -3,7 +3,10 @@
 * 日期 / Date: 2026-09-29
 * 范围 / Scope: 表容器运行时（trm-lite `tl_tbl`）、编译器表构造 codegen、语言原语能力、内存占用
 * 证据来源 / Evidence: 平台实测（斜率法差值计时）+ LLVM IR + `llvm-objdump` 反汇编
-* 相关文档 / Related: `tdb/docs/perf-zd.md`（zd 侧已落地优化与基准工具）
+* 相关文档 / Related:
+  * **续篇（必读 / must read）**: `2026-09-29-tie-perf-safety-and-startup.md`
+    —— 锁占比实测（诊断变体）、安全优化路径、启动时间构成，**并更正本报告 P2/P3/P7 与路线图**
+  * `tdb/docs/perf-zd.md`（zd 侧已落地优化与基准工具）
 
 ---
 
@@ -76,9 +79,11 @@ so measurements use external microsecond timestamps plus a **slope method**
   tie 连读都加锁。
 * **影响 / Impact**：全部表承载路径。解码侧尤甚（解码热路径几乎全是「读一个字节 + 判断 + 取值」）。
 * **建议 / Proposal**：
-  1. **同线程重入快路径（推荐首选，低风险）**：句柄增 `owner_tid @48` + `depth @56`；
-     `lock_enter` 先比 TID，同线程只递增深度，异线程才走 OS 锁。跨线程语义与今天完全一致，
-     单线程（绝大多数路径）成本降到一次比较。预期 25–40 → ≈15 ns（锁占比约 20 ns，**≈2×**）。
+  1. **归属快路径 `rc==1 → 免锁`**（原写「同线程重入快路径」，**已更正**——同线程重入只在
+     嵌套调用时有效，对平铺的单次访问无用）：句柄增 `owner_tid`；入口判
+     `refcount == 1 && owner_tid == my_tid` 则免锁访问，否则走原加锁路径。`rc==1` 意味全程序
+     只有一份引用、无第二线程可访问它 ⇒ 免锁无竞争对象（完整论证与已知移交窗口见续篇 §2.2）。
+     预期 `t[i]` **28 → ≈10–12 ns（≈2.5–2.8×）**，需并发评审。
   2. 读路径 `tbl_at` 可考虑**免锁**（读与扩容 realloc 的竞态才是加锁动机；可在扩容时用
      「换址后旧缓冲延迟释放」或原子交换指针消除读侧竞态）。风险中等，需并发评审。
 
@@ -90,8 +95,11 @@ so measurements use external microsecond timestamps plus a **slope method**
   8 字节 load/store**——已用 `llvm-objdump -d trm_lite.a` 反汇编确认（含 SIMD 打包序列）。
 * **影响 / Impact**：每次字段访问放大 8–16 倍；`ensure_locked` 每次重新读 cap/len/data/esz
   （调用方刚读过，纯重复）。
+* **严重性更正 / severity corrected（2026-09-29 续篇实测）**：本项**单项收益有限**——
+  去锁诊断变体测得 `tbl_at` 的**有效工作仅 8 ns**（含调用、232 B 栈帧、全部字段读取与
+  memcpy），而锁占 **20 ns**。**不应绕过 P1 单独改 P2。**
 * **建议 / Proposal**：语言层提供**宽指针 deref**（下条 P3）后，`r_i64`/`w_i64` 各降为
-  一条 load/store（≈4×）；在此之前可先用 `memset`/`memcpy` 桥或 `@llvm` 内建做整字访问。
+  一条 load/store；在此之前可先用 `memset`/`memcpy` 桥或 `@llvm` 内建做整字访问。
 
 ### P3 — 缺少宽指针 deref（语言能力缺口）/ No wide-pointer deref
 
@@ -100,8 +108,10 @@ so measurements use external microsecond timestamps plus a **slope method**
 * **根因 / Root cause**：语言/编译器未开放宽指针类型转换（既有 `unsafe` 体系只覆盖 `ptr<u8>`）。
 * **影响 / Impact**：这是 **P2 无法在 tie 层修复**的唯一原因，也是所有指针密集运行时代码
   （表容器、通道、GC、调度器）的共同上限。
+* **严重性更正 / severity corrected**：P2 的有效工作总量只有 8 ns，**该项在 P1 未解前收益
+  上限约 3–4 ns**。优先级**下调**——P1（锁）才是主战场。见续篇 §2.2/§5。
 * **建议 / Proposal**：开放 `ptr_cast`/`int_to_ptr_typed` 或允许 `ptr<T>` 声明带显式转换
-  （仍在 `unsafe` 内）。这是**性价比最高的编译器改动**：一处能力，全部运行时代码受益。
+  （仍在 `unsafe` 内）。一处能力，全部运行时代码受益；但**排期应在 P1 之后**。
 
 ### P4 — `table<i64>` 承载字节 = 8× 内存膨胀 / 8× memory bloat
 
@@ -136,13 +146,18 @@ so measurements use external microsecond timestamps plus a **slope method**
 * **建议 / Proposal**：补 `time_now_ns()`（或 `time_monotonic_us()`）原语；顺带让
   `std/time` 的 `tick_ms`/`elapsed_ms` 名副其实。
 
-### P7 — 最小程序启动成本 ≈ 680 ms
+### P7 — 最小程序启动成本 ≈ 680 ms（**已更正 / corrected**）
 
 * **现象 / Symptom**：`func main() { println("hi") }` 实测 **≈ 600–850 ms**（多次取样）。
-* **影响 / Impact**：CLI 工具的响应体验、测试迭代速度、以及一切短时进程的可用性；
-  也为性能测量设置了下限（见 §二）。
-* **建议 / Proposal**：需专项剖析（静态初始化、运行时初始化、DLL 装载、argv 处理等），
-  本次未拆解，列为独立事项。
+* **已更正 / corrected（2026-09-29 续篇实测）**：该数字的**绝大部分不是 tie 的成本**——
+  `cmd /c exit`（纯 Windows 进程创建）即 **612–660 ms**，同规格 C 空程序 **616–679 ms**。
+  即 **≈90% 是本机进程创建 + 杀软地板**；tie 相对 C 的边际仅 **+23 ~ +83 ms**（随负载漂移）。
+  已用证据排除：`main` 体（空程序为 `ret i32 0`）、全局构造器（无）、体积（+20 KB ≈ +0.3 ms，
+  实测 14 ms/MB）、额外 DLL（只导入 KERNEL32 的标准 CRT 集）。
+* **影响 / Impact（更正后）**：对**长驻进程无影响**（启动只付一次）；对 CLI 是**地板问题**，
+  tie 侧可优化空间 ≤80 ms。**正确方向是摊销（减少进程启动次数），不是提速。**
+* **建议 / Proposal**：见续篇 `2026-09-29-tie-perf-safety-and-startup.md` §4。若确要压那 ≤80 ms，
+  只能从杀软/PE 布局（`.fptable` 非标准段）入手，需专项。
 
 ### P8 — `ensure_locked` 重复读字段 / Redundant field reads
 
@@ -180,15 +195,18 @@ so measurements use external microsecond timestamps plus a **slope method**
 | 序 / # | 动作 / action | 归属 / owner | 预期 / expected | 风险 / risk |
 | ---: | --- | --- | --- | --- |
 | 1 | 原始字节缓冲抽象（字符串/StringBuilder 承载） | 语言/std/zd | **内存 8× → 1×**；访问 ≈30 → 6 ns | **低**（纯新增） |
-| 2 | trm-lite 同线程重入快路径（owner TID + 深度） | trm-lite | 表访问 ≈ 2× | 低（跨线程语义不变） |
+| 2 | trm-lite 归属快路径（`rc==1 && owner==me` → 免锁） | trm-lite | `t[i]` 28 → ≈11 ns（≈2.5×） | 中（需并发评审） |
 | 3 | 编译器表字面量批量 codegen | tiec | 定宽编码 ≈ 10× | 低（纯 codegen） |
 | 4 | 补 `time_now_ns` 原语 | 编译器/std | 可测性 | 低 |
 | 5 | 语言宽指针 deref（`ptr<T>` 转换） | tiec | 字段访问 ≈ 4×，全运行时代码受益 | 中 |
 | 6 | 批量追加原语 `tbl_append(h, src, n)` | trm-lite + tiec | 逐元素 → memcpy 级（> 100×） | 中 |
 | 7 | 启动成本剖析（≈680 ms） | trm-lite + tiec | 未量化 | 需专项 |
 
-**优先建议：1 + 2 + 3**——三者互不冲突、风险都低，合起来可把「表承载字节流」这一最常见
-场景的**内存降到 1/8、访问提速约 10 倍**。第 5 项是其余运行时优化的总闸门，值得单独立项。
+**优先建议（2026-09-29 续篇修订）**：① **批量原语**（零并发语义改变，最安全）→
+② **归属快路径 `rc==1` 免锁**（≈2.8×，需并发评审）→ ③ 字节缓冲承载（内存 1/8）→
+④ 表字面量批量 codegen。原始「同线程重入快路径」表述有误（对平铺访问无效，见续篇 §2.2 注）。
+实测结论：**锁占 `t[i]` 的 71%、`table_push` 的 57%**，是唯一的大头；宽指针 deref（第 5 项）
+在锁未解前收益上限仅 3–4 ns，**优先级下调**。
 
 **EN:** Priorities 1–3 are independent, low-risk, and together reduce the most common
 byte-stream-over-table scenario to **1/8 memory and ≈10× faster access**. Item 5 (wide-pointer
