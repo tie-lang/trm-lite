@@ -1,5 +1,46 @@
 # trm-lite 变更日志
 
+## r.1.6.6 — 2026-09-29
+
+- **表容器热路径优化 + 批量原语（`core/tbl/tl_tbl.tie`）**。全部为**并发语义不变**
+  的改动（同一临界区、同一 len 提交、同一扩容规则），有三探针 + tdb 8 探针回归。
+  - **批量原语新增**：`tbl_append(h, src, n)` —— 一次锁内追加 n 个连续元素，把
+    「N 次 `tbl_push` = N 次加锁」粗化为「1 次加锁做 N 个元素」，语义与连续 n 次
+    push **逐元素等价**（探针有专门等价性断言）；`tbl_reserve(h, need)` —— 一次锁内
+    预留容量（不改 len），供「一次分配 + 一次锁」的批量构造路径。这是**不需要任何
+    并发论证**的优化路径：原语层只是把 N 次操作放进同一个临界区。
+  - **热路径去冗余读**：`tbl_push`/`tbl_at`/`tbl_set` 原先各自经 `lock_enter` +
+    `lock_leave` 各调一次 `lock_of(h)`（即每次访问白读 16 次句柄字节），且
+    `ensure_locked` 内部**重读**调用方刚读过的 cap/len/data/esz（32 次字节访问）。
+    现改为锁地址只读一次、扩容抽出参数化核心 `grow()` 复用已读字段。
+  - **实测**（tdb `tests/ab2.sh` 稳健 A/B，n=100000，R=100，多轮取最小总时间减同形
+    noop）：`table_push` **43ns → 32ns（−26%）**；`t[i]` 26ns → 24ns（−8%）。
+    push 受益更大是因其原本冗余读最多。
+  - **探针**：新增 `tests/s_tbl/tl_tbl_append_probe.tie`（12 项：批量追加返回/长度/
+    内容顺序/越界零值/跨扩容边界/扩容后旧元素保留/新元素正确/n≤0 no-op/reserve 不改
+    len/reserve 后追加/与连续 push 逐元素等价）；`tl_tbl_probe`、`tl_tbl_rc_probe`
+    输出与期望逐字一致。
+  - **构建约束（重要）**：`trm_lite.a` 是编译器**默认链的库**，升格即影响所有 tie
+    程序（含 tiec 自举）——升格前必须跑三阶不动点 + 回归。
+  - 探针写法坑（已写入注释）：`deref` 是 `ptr<u8>` **单字节读**，元素值须取 <256
+    （既有探针全程如此，故未暴露）；把同一缓冲经 `ptr_to_int` 反复传入外部函数会
+    触发 LLVM 别名盲区（`deref` 被提升出循环），循环内取值须在循环内分配缓冲。
+
+  EN: r.1.6.6 — table-container hot-path optimization + bulk primitives
+  (`core/tbl/tl_tbl.tie`), all with unchanged concurrency semantics (same critical
+  section, same length commit, same growth rule); verified by three tl_tbl probes
+  plus eight tdb probes. Added `tbl_append(h, src, n)` (append n contiguous elements
+  under **one** lock — element-wise equivalent to n consecutive pushes, with a
+  dedicated equivalence assertion) and `tbl_reserve(h, need)`. Removed redundant
+  handle reads on the hot path: `tbl_push`/`tbl_at`/`tbl_set` used to call `lock_of`
+  twice per access (16 byte reads) and `ensure_locked` used to re-read the four
+  fields the caller had just read (32 byte reads); now the lock address is read once
+  and growth is factored into a parameterized `grow()` that reuses them. Measured
+  (tdb `tests/ab2.sh`, robust A/B): `table_push` 43ns -> 32ns (-26%), `t[i]`
+  26ns -> 24ns (-8%). Note: `trm_lite.a` is the compiler's default-linked runtime
+  library, so promotion affects every tie program (including the tiec bootstrap) —
+  the three-stage fixed point plus regressions are mandatory before promotion.
+
 ## r.1.6.5 — 2026-09-10
 
 - **同步/线程原语跨平台移植（Linux pthread）**：同一份 tie 源码按平台分支——

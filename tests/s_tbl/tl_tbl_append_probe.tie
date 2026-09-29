@@ -1,0 +1,153 @@
+type tie<logic>
+// ============================================================
+// trm-lite tl_tbl 批量原语单测（p.9.6.3）
+// 覆盖：tbl_append（一次锁追加 n 个元素）/ 跨扩容边界 / n<=0 / tbl_reserve。
+// **语义等价性**：tbl_append 的结果必须与「连续 n 次 tbl_push」逐元素完全相同。
+// 期望输出：PASS all（全程布尔断言；注意 deref 为 ptr<u8> 单字节读，
+// 故元素值取 <256，与既有 tl_tbl_probe 同风格）
+// ============================================================
+import "../../core/tbl/tl_tbl.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func main() {
+    unsafe {
+        // 源缓冲：5 个 i64 元素（110/220/330/440/550）
+        var src = alloc(40)
+        var k: i64 = 0
+        while k < 5 {
+            deref_write(int_to_ptr(ptr_to_int(src) + k * 8), (k + 1) * 11)
+            k = k + 1
+        }
+
+        // ---------- 1) 批量追加 5 个元素（一次锁） ----------
+        var h = tl_tbl.tbl_new(8)
+        var n1 = tl_tbl.tbl_append(h, ptr_to_int(src), 5)
+        check(n1 == 5, "append 返回新长度 5（实际 " + to_string(n1) + "）")
+        check(tl_tbl.tbl_len(h) == 5, "append 后 len == 5")
+        // 注意：缓冲须在**循环内**分配——把同一个 ptr 经 ptr_to_int 反复传入外部函数，
+        // LLVM 无法看到该 int 与 out 的别名关系，会把 deref(out) 提升出循环（读到首值）。
+        // 这是 int↔ptr 往返的别名盲区（探针陷阱，非 tl_tbl 缺陷）。
+        var out = alloc(8)
+        var i: i64 = 0
+        var seq_ok: bool = true
+        while i < 5 {
+            var oi = alloc(8)
+            tl_tbl.tbl_at(h, i, ptr_to_int(oi))
+            if deref(oi) != (i + 1) * 11 {
+                seq_ok = false
+            }
+            free(oi)
+            i = i + 1
+        }
+        check(seq_ok, "append 内容与顺序正确（11..55）")
+
+        // ---------- 2) append 后 len 精确：越界读为零值 ----------
+        var ok = tl_tbl.tbl_at(h, 5, ptr_to_int(out))
+        check(ok == 0 && deref(out) == 0, "append 后越界读 ok=0 且零值")
+
+        // ---------- 3) 跨扩容边界追加（cap 8 → need 9 触发 1.5x 扩容） ----------
+        var src2 = alloc(32)
+        k = 0
+        while k < 4 {
+            deref_write(int_to_ptr(ptr_to_int(src2) + k * 8), 70 + k * 10)
+            k = k + 1
+        }
+        var n2 = tl_tbl.tbl_append(h, ptr_to_int(src2), 4)
+        check(n2 == 9, "跨扩容边界 append 返回 9（实际 " + to_string(n2) + "）")
+        var keep_ok: bool = true
+        var i0: i64 = 0
+        while i0 < 5 {
+            var ok_a = alloc(8)
+            tl_tbl.tbl_at(h, i0, ptr_to_int(ok_a))
+            if deref(ok_a) != (i0 + 1) * 11 {
+                keep_ok = false   // 扩容后旧元素必须保留
+            }
+            free(ok_a)
+            i0 = i0 + 1
+        }
+        var new_ok: bool = true
+        var i2: i64 = 0
+        while i2 < 3 {
+            var ok_b = alloc(8)
+            tl_tbl.tbl_at(h, 5 + i2, ptr_to_int(ok_b))
+            if deref(ok_b) != 70 + i2 * 10 {
+                new_ok = false
+            }
+            free(ok_b)
+            i2 = i2 + 1
+        }
+        check(keep_ok, "扩容后旧元素全部保留")
+        check(new_ok, "扩容后新元素正确（70/80/90）")
+
+        // ---------- 4) n<=0 空追加：len 不变 ----------
+        var n3 = tl_tbl.tbl_append(h, ptr_to_int(src2), 0)
+        check(n3 == 9 && tl_tbl.tbl_len(h) == 9, "n=0 追加为 no-op（len 仍 9）")
+
+        // ---------- 5) reserve 预留容量后追加仍正确 ----------
+        tl_tbl.tbl_reserve(h, 64)
+        check(tl_tbl.tbl_len(h) == 9, "reserve 不改变 len")
+        var src3 = alloc(8)
+        deref_write(src3, 42)
+        var n4 = tl_tbl.tbl_append(h, ptr_to_int(src3), 1)
+        check(n4 == 10, "reserve 后追加返回 10（实际 " + to_string(n4) + "）")
+        tl_tbl.tbl_at(h, 9, ptr_to_int(out))
+        check(deref(out) == 42, "reserve 后追加内容正确（42）")
+
+        // ---------- 6) 与逐次 tbl_push 的语义等价性 ----------
+        var ha = tl_tbl.tbl_new(8)
+        var hb = tl_tbl.tbl_new(8)
+        var src6 = alloc(64)
+        k = 0
+        while k < 8 {
+            deref_write(int_to_ptr(ptr_to_int(src6) + k * 8), k * 7 + 1)
+            k = k + 1
+        }
+        // ha：逐次 push 8 次；hb：一次 append 8 个
+        k = 0
+        while k < 8 {
+            tl_tbl.tbl_push(ha, ptr_to_int(src6) + k * 8)
+            k = k + 1
+        }
+        tl_tbl.tbl_append(hb, ptr_to_int(src6), 8)
+        var equiv: bool = true
+        if tl_tbl.tbl_len(ha) != tl_tbl.tbl_len(hb) {
+            equiv = false
+        }
+        var i3: i64 = 0
+        while i3 < 8 {
+            var oa = alloc(8)
+            var ob = alloc(8)
+            tl_tbl.tbl_at(ha, i3, ptr_to_int(oa))
+            tl_tbl.tbl_at(hb, i3, ptr_to_int(ob))
+            if deref(oa) != deref(ob) {
+                equiv = false
+            }
+            free(oa)
+            free(ob)
+            i3 = i3 + 1
+        }
+        check(equiv, "tbl_append == 连续 tbl_push（逐元素等价）")
+
+        free(src)
+        free(src2)
+        free(src3)
+        free(src6)
+        free(out)
+
+        if fails == 0 {
+            println("PASS all")
+        } else {
+            println("FAIL total=" + to_string(fails))
+        }
+    }
+}

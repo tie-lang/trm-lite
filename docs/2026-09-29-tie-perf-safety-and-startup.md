@@ -57,7 +57,20 @@ tests/ab2.sh /tmp/perf_base.exe /tmp/perf_nolock.exe readloop 100000 100 8
 
 ## 二、安全的大幅优化 / Safe Large Optimizations
 
-### 2.1 批量原语（首选：零并发语义改变）
+### 2.1 批量原语（首选：零并发语义改变）——**运行时侧已落地（r.1.6.6）**
+
+> **状态 / Status**：运行时原语**已实现并回归通过**（`trm-lite` r.1.6.6）：
+> * 新增 `tbl_append(h, src, n)`（一次锁追加 n 个连续元素，与连续 n 次 `tbl_push`
+>   **逐元素等价**，探针有专门等价性断言）与 `tbl_reserve(h, need)`（一次锁预留容量）。
+> * 顺带做掉热路径冗余读：`tbl_push`/`tbl_at`/`tbl_set` 原先每次访问白读 16 次句柄字节
+>   （`lock_enter` + `lock_leave` 各调一次 `lock_of`），`ensure_locked` 又重读调用方刚读过的
+>   4 个字段（32 次字节访问）。**实测**（稳健 A/B）：`table_push` **43 → 32 ns（−26%）**、
+>   `t[i]` **26 → 24 ns（−8%）**。
+> * 验证：`tl_tbl_probe`/`tl_tbl_rc_probe` 输出与期望逐字一致 + 新增
+>   `tl_tbl_append_probe`（12 项）+ tdb 8 个 zd 探针全绿 + 三阶不动点。
+> * **编译器接线仍待做**（把 `table_append` 暴露为标准内建 + 表字面量批量 codegen），
+>   完成后批量路径才能被 tie 源码直接使用；届时逐元素循环可整体切到批量原语。
+
 
 **做什么**：给表容器加批量接口——`tbl_append(h, src_bytes, n)`（一次加锁 + 一次 `ensure`
 + 一次 `memcpy`）、`tbl_reserve(h, n)`（预分配）、`tbl_read_block(h, i, out, n)`。
