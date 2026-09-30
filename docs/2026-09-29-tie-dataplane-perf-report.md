@@ -195,7 +195,7 @@ so measurements use external microsecond timestamps plus a **slope method**
 | 序 / # | 动作 / action | 归属 / owner | 预期 / expected | 风险 / risk |
 | ---: | --- | --- | --- | --- |
 | 1 | 原始字节缓冲抽象（字符串/StringBuilder 承载） | 语言/std/zd | **内存 8× → 1×**；访问 ≈30 → 6 ns | **低**（纯新增） |
-| 2 | ~~trm-lite 归属快路径（`rc==1 && owner==me` → 免锁）~~ **已实测证伪并回滚**（运行期逃逸标志无法检测「经全局变量共享」；见续篇 §3.3）| ~~trm-lite~~ → **tiec（irgen 编译期逃逸分析）** | 未量化 | 需静态分析设计 |
+| 2 | ~~运行期归属快路径~~ **已证伪回滚**（续篇 §3.3）；**替代＝编译期独占分析，已落地**（续篇 §2.2b）| tiec（irgen） | 单次访问 ≈16 → ≈3 ns（**≈5×**）；整模式 1.3–1.7× | **r.1.6.7 已完成** |
 | 3 | 编译器表字面量批量 codegen | tiec | 定宽编码 ≈ 10× | 低（纯 codegen） |
 | 4 | 补 `time_now_ns` 原语 | 编译器/std | 可测性 | 低 |
 | 5 | 语言宽指针 deref（`ptr<T>` 转换） | tiec | 字段访问 ≈ 4×，全运行时代码受益 | 中 |
