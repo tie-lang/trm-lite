@@ -329,4 +329,61 @@ pub unsafe fn tbl_set(h: i64, i: i64, src: i64) -> i64 {
     return ok
 }
 
+
+// ==================== 免锁入口（r.1.6.7，仅供编译器静态证明独占时使用） ====================
+// **调用方契约**：仅当 tiec 的**编译期独占分析**（`compiler/backend/irgen_esc.tie`）
+// 证得「该表句柄在整个访问点上从未离开本次函数调用」——即该表不可能是全局变量、
+// 函数参数、被闭包捕获、被存入别的容器或被返回——才可调用本组入口。此时全程序
+// 只有当前执行流持有该句柄，**不存在并发访问者**，故跳过每表 CRITICAL_SECTION。
+//
+// 为什么必须是**编译期**证明而不是运行期标志：运行期「未逃逸」标志（esc@48）已被
+// 实测证伪——表可经全局变量/堆槽被多线程共享而**不触发任何 retain**，标志恒为
+// 「未逃逸」⇒ 漏锁 ⇒ 真实数据竞争。见 `compiler/backend/irgen_esc.tie` 头注释与
+// trm-lite `docs/2026-09-29-tie-perf-safety-and-startup.md` §3.3。
+//
+// 三个入口与加锁版**逐指令等价**，唯一差别是不取锁。误用（表实际被并发访问）会
+// 造成与加锁版被绕过时同样后果的数据竞争 —— 故 irgen 侧一律「宁可少优化」：
+// 判据存疑时不生成 _nl 调用。
+
+// 免锁下标读：语义与 tbl_at 完全一致（越界写零 out 并返回 0）。
+pub unsafe fn tbl_at_nl(h: i64, i: i64, out: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var data = r_i64(p, 16)
+    var ok: i64 = 0
+    if i < len {
+        memcpy(int_to_ptr(out), int_to_ptr(data + i * esz), esz)
+        ok = 1
+    } else {
+        memset(int_to_ptr(out), 0, esz)
+    }
+    return ok
+}
+
+// 免锁下标写：语义与 tbl_set 完全一致（越界静默返回 0）。
+pub unsafe fn tbl_set_nl(h: i64, i: i64, src: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var data = r_i64(p, 16)
+    var ok: i64 = 0
+    if i < len {
+        memcpy(int_to_ptr(data + i * esz), int_to_ptr(src), esz)
+        ok = 1
+    }
+    return ok
+}
+
+// 免锁追加：语义与 tbl_push 完全一致（同扩容规则、同 len 提交）。
+pub unsafe fn tbl_push_nl(h: i64, src: i64) {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + 1
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), esz)
+    w_i64(p, 8, need)
+}
+
 }

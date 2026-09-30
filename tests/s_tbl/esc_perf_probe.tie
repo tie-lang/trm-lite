@@ -1,0 +1,132 @@
+type tie<logic>
+// tests/s_tbl/esc_perf_probe.tie —— r.1.6.7 编译期独占免锁的收益 A/B
+// ---------------------------------------------------------------------------
+// 用法：esc_perf_probe <case> <n> <rep>
+//   local_push   推入**局部新鲜表**（静态证得独占 ⇒ tbl_push_nl 免锁）
+//   global_push  推入**全局表**（永不独占 ⇒ 加锁）——与上者唯一差别是载体归属
+//   local_at     读**局部新鲜表**（tbl_at_nl 免锁）
+//   global_at    读**全局表**（tbl_at 加锁）
+//   local_set    写**局部新鲜表**
+//   global_set   写**全局表**
+//   noop         同形空转（差值法扣除固定成本）
+//
+// 两侧的循环形状、访存模式、元素类型完全一致，唯一变量是**该表是否被静态证明独占**
+// ⇒ 差值即锁的净成本。计时一律外部（tie 只有秒级时间源）。
+import "../../core/mnn/sched.tie"
+import "../../core/tbl/tl_tbl.tie"
+
+var g_global: table<i64> = []   // 全局表：esc 分析永不允许免锁
+var g_acc: i64 = 0
+
+// 每例一个**独立函数**：esc 状态是函数级的，放在同一函数的 if/else 链里会让
+// 各分支的状态互相干扰（分支合并后不精确），独立函数才能准确对应「该表独占」。
+func case_local_push(n: i64) -> i64 {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(t, i)
+        i = i + 1
+    }
+    return len(t)
+}
+func case_global_push(n: i64) -> i64 {
+    g_global = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(g_global, i)
+        i = i + 1
+    }
+    return len(g_global)
+}
+func case_local_at(n: i64) -> i64 {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(t, i)
+        i = i + 1
+    }
+    var s: i64 = 0
+    var j: i64 = 0
+    while j < n {
+        s = s + t[j]
+        j = j + 1
+    }
+    return s
+}
+func case_global_at(n: i64) -> i64 {
+    g_global = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(g_global, i)
+        i = i + 1
+    }
+    var s: i64 = 0
+    var j: i64 = 0
+    while j < n {
+        s = s + g_global[j]
+        j = j + 1
+    }
+    return s
+}
+func case_local_set(n: i64) -> i64 {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(t, 0)
+        i = i + 1
+    }
+    var j: i64 = 0
+    while j < n {
+        t[j] = j
+        j = j + 1
+    }
+    return t[n - 1]
+}
+func case_global_set(n: i64) -> i64 {
+    g_global = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(g_global, 0)
+        i = i + 1
+    }
+    var j: i64 = 0
+    while j < n {
+        g_global[j] = j
+        j = j + 1
+    }
+    return g_global[n - 1]
+}
+
+func main() {
+    var cs: string = arg_string(0)
+    var n: i64 = 1024
+    if arg_count() > 1 {
+        n = parse_int(arg_string(1))
+    }
+    var rep: i64 = 1
+    if arg_count() > 2 {
+        rep = parse_int(arg_string(2))
+    }
+    var r: i64 = 0
+    var acc: i64 = 0
+    while r < rep {
+        if cs == "local_push" {
+            acc = acc + case_local_push(n)
+        } else if cs == "global_push" {
+            acc = acc + case_global_push(n)
+        } else if cs == "local_at" {
+            acc = acc + case_local_at(n)
+        } else if cs == "global_at" {
+            acc = acc + case_global_at(n)
+        } else if cs == "local_set" {
+            acc = acc + case_local_set(n)
+        } else if cs == "global_set" {
+            acc = acc + case_global_set(n)
+        } else {
+            acc = acc + 1
+        }
+        r = r + 1
+    }
+    g_acc = acc
+    println("sink=" + to_string(g_acc))
+}
