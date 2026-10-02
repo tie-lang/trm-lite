@@ -1,4 +1,4 @@
-type tie<logic>
+type tie<logic, unsafe:mem>
 // tests/s_gen/gen_mig_probe.tie —— p.9.5.2 生成器任务迁移/窃取探针
 // 覆盖（全部断言，FAIL 即 exit(1)）：
 //   1. 惰性管道流（无限源 → take 512 → filter 偶 → fmap 半 → take 64，期望

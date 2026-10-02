@@ -1,4 +1,4 @@
-type tie<logic>
+type tie<logic, unsafe:mem>
 // ============================================================
 // trm-lite tl_tbl 字节层表容器单测（P2a）
 // 覆盖：new/len/ensure/at/set、扩容边界、越界零值/静默、扩容数据保留。

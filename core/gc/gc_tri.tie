@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem>
 // core/gc/gc_tri.tie —— trm-lite 复杂形态 GC（p.6.5.3 并发三色 / p.6.5.4 分代 + 整理）
 // 托管堆模型（tie 可表达的扁平对象图，对象 id 即下标）：
 //   对象表 g_o_size/g_o_alive/g_o_color/g_o_age（并行 table<i64>；age 分代）

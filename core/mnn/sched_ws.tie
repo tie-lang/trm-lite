@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem, unsafe:ext>
 // core/mnn/sched_ws.tie —— trm-lite 复杂形态 work-stealing 调度器（p.6.5.2 多线程 / p.6.5.3 并入后台回收器 / p.6.5.5 可迁移栈 / p.6.7.8 常驻池 / p.6.7.9 per-P 细锁）
 // 多 OS 线程池 + 每线程双端队列 + 任务窃取 + M:N 承托 + **并发三色 GC 后台回收器**：
 //   · 任务承载 = 注册表 g_regs（table<fn() -> i64>）+ 队列元素 regid（table<i64>）
@@ -410,11 +410,15 @@ func ensure_pool() {
     var i: i64 = 0
     while i < g_workers {
         var th: i64 = 0
-        th = tl_sync.thr_create(0, 0, cb_ptr(worker_main), i, 0, 0)
+        unsafe {
+            th = tl_sync.thr_create(0, 0, cb_ptr(worker_main), i, 0, 0)
+        }
         table_push(g_ths, th)
         i = i + 1
     }
-    g_gc_th = tl_sync.thr_create(0, 0, cb_ptr(gc_worker_main), 0, 0, 0)
+    unsafe {
+        g_gc_th = tl_sync.thr_create(0, 0, cb_ptr(gc_worker_main), 0, 0, 0)
+    }
 }
 
 // 池销毁（仅 shutdown 路径）：join 全部 worker + 后台回收器（见 g_shutdown=1 退出）。

@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem>
 // core/chan/tl_chan.tie —— trm-lite channel（mailbox）承载（p.6.5.7）
 // 语义对标 Go（简化子集，互斥 + 条件变量）：
 //   · ch_send(ch, v)：锁定入队 + 唤醒一个等待者；通道关闭 → -1；队列满 → 0

@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem>
 // core/tbl/tl_tbl.tie —— trm-lite 字节层表容器（命名空间 tl_tbl）。
 // ============================================================
 // 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 48 字节句柄

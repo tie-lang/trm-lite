@@ -1,4 +1,4 @@
-type tie<logic>
+type tie<logic, unsafe:mem>
 // tests/s_tbl/tl_tbl_conc_probe.tie —— 表容器并发正确性验证
 // ---------------------------------------------------------------------------
 // 用途：

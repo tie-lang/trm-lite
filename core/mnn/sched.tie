@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem, unsafe:ext>
 // core/mnn/sched.tie —— trm-lite 简单形态执行内核（命名空间 trm_lite_sched，p.6.7.6/6.7.7）。
 // p.6.7.6 S-pool 常驻线程池：内置 spawn 入队 → 常驻 worker 线程并行抢执行，yield=同步点。
 // p.6.7.7 S-deque：把「单全局队列」升级为 per-worker 双端队列——owner 段尾 LIFO 自取、

@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem>
 // core/gen/tl_gen.tie —— p.9.5.1 生成器式协程运行期：惰性迭代/流（trm-lite 侧）。
 // 定位：语言侧 yield（p.9.11.15，tiec f04962d）目前编译为「攒表返回」——生成器
 // 签名登记为 table<elem>，调用方得表，for 直接消费（急切物化、无运行期调用点）；

@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem>
 // core/gc/gc.tie —— trm-lite 阶段1：简单 mark-sweep GC（stop-the-world，命名空间 trm_lite_gc）。
 // 对标 trm core/gc 的探针语义：扁平对象图（size/alive/marked）+ 扁平边表（from/to/alive），
 // 精确根集；从根全扫标记（栈预分配、无链式指针），再清扫不可达。

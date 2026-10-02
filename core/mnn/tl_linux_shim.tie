@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem, unsafe:ext>
 // core/mnn/tl_linux_shim.tie —— Linux 平台 Win32 同步/线程原语对等实现（r.1.6.5）
 // 目标：**同一份 tie 源码按平台分支**——trm-lite 各模块（sched/sched_ws/wg/tl_chan/
 // gc_tri/tl_tbl）一律按 tl_k32 的 Win32 符号名调用（EnterCriticalSection/CreateThread/

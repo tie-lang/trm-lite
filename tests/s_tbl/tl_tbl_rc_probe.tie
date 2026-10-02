@@ -1,4 +1,4 @@
-type tie<logic>
+type tie<logic, unsafe:mem>
 // ============================================================
 // trm-lite tl_tbl 引用计数单测（p.6.10.2 步1）
 // 覆盖：tbl_new refcount=1 / retain 递增 / release 递减 / 归零释放。
