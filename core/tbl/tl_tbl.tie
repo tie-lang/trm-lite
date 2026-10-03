@@ -386,4 +386,102 @@ pub unsafe fn tbl_push_nl(h: i64, src: i64) {
     w_i64(p, 8, need)
 }
 
+// ==================== 写时复制（r.1.6.8，非 unsafe 区的默认写入前提） ====================
+// **解决什么**：共享句柄的两个别名（`var b = a`，rc=2）在写入时互相可见——
+// 更严重的是**越界写自动扩容（p.9.12.2）会改写共享的 len/cap**，于是
+// `var a=[1,2,3]; var b=a; b[100]=42` 会让 `len(a)` 也变成 101（实测）。写 b
+// 静默改变了 a 的形状——这正是「非 unsafe 区写不出危险代码」要杜绝的。
+//
+// **做法**：写入前先分离——rc > 1 说明还有别的别名，此刻克隆表体得到独占副本
+// （rc=1），把写落在副本上；rc == 1 说明独占，直接原地写（零额外成本）。
+// 返回**可能已更新的句柄**，调用方负责写回自己的槽：
+//     t = tbl_cow(t)      // 分离（独占时原样返回）
+//     t = tbl_set_cow(t, i, v)
+//
+// **为何前置分离而不是在 tbl_set 内部判断**：越界扩容发生在 tbl_set **之前**
+// （编译器 s21_table_set_ex 先 push 零值把 len 撑到 need）。若只在 tbl_set 里
+// 分离，扩容早已污染共享的旧表。分离必须早于任何字段改写。
+//
+// **为何不用运行期「独占标志」**：与免锁入口同一理由（r.1.6.7）——表可经全局槽
+// 被多线程共享而不触发 retain，标志会恒为「独占」。refcount 是**已存在的真实
+// 计数**（tbl_retain/tbl_release 维护），不引入新状态。
+//
+// **成本**：独占路径 = 一次 r_i64(rc) 读（8 次字节访问）后直接返回；共享路径 =
+// 首次写付一次 O(len) 克隆，此后副本 rc=1 恢复独占。相较「每次赋值深拷贝」
+// （每次 O(len)），只在真正发生共享写时才付费。
+
+// 克隆表体：返回全新句柄（rc=1，数据为 len*esz 字节的独立副本）。
+// 深表逐元素 retain（新表与旧表各自持有一份元素引用；旧表最终 release 时会
+// 逐元素 release，两侧守恒）。普通表的元素按字节拷贝——元素若是 string，
+// 两个表得到各自独立的 (ptr,len) 副本而**共享同一字节缓冲**：string 无
+// refcount 且不可变（见 smove.is_owned 注释），共享只读缓冲没有别名写风险。
+unsafe fn tbl_clone_body(h: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24)             // 含深表标记位
+    var pure = esz & TBL_MASK
+    var deep = (esz & TBL_DEEP) != 0
+    var nh = alloc(48)                 // nh 已是 ptr（同 tbl_new 的 h）
+    var ncap: i64 = 0
+    var ndata: i64 = 0
+    if len > 0 {
+        var ndp = alloc(len * pure)
+        ndata = ptr_to_int(ndp)
+        memcpy(ndp, int_to_ptr(r_i64(p, 16)), len * pure)
+        ncap = len
+    }
+    w_i64(nh, 0, ncap)
+    w_i64(nh, 8, len)
+    w_i64(nh, 16, ndata)
+    w_i64(nh, 24, esz)                 // 原样保留深表标记
+    w_i64(nh, 40, 1)
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    w_i64(nh, 32, ptr_to_int(lk))
+    if deep {
+        var i: i64 = 0
+        while i < len {
+            var eh = r_i64(int_to_ptr(ndata + i * 8), 0)
+            if eh != 0 {
+                tbl_retain(eh)
+            }
+            i = i + 1
+        }
+    }
+    return ptr_to_int(nh)
 }
+
+// 分离：共享（rc>1）→ 克隆并放弃对旧表的一次引用；独占 → 原样返回。
+// 返回值即调用方应当写回自己槽的句柄。
+pub unsafe fn tbl_cow(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    if r_i64(int_to_ptr(h), 40) <= 1 {
+        return h                      // 独占：无需分离
+    }
+    var nh = tbl_clone_body(h)
+    tbl_release(h)                    // 让出对旧表的一份引用（其它别名仍在）
+    return nh
+}
+
+// COW 下标写（非 unsafe 区的默认路径）：必要时先分离再写，返回应写回的句柄。
+// 越界语义与 tbl_set 一致（静默返回 0，不写）。扩容由编译器侧先行处理——
+// 故本入口收到的 i 必然 < len；此处仍保留越界守卫以防直接调用。
+pub unsafe fn tbl_set_cow(h: i64, i: i64, src: i64) -> i64 {
+    var nh = tbl_cow(h)
+    tbl_set(nh, i, src)
+    return nh
+}
+
+// COW 追加（非 unsafe 区的默认路径）：必要时先分离再 push，返回应写回的句柄。
+pub unsafe fn tbl_push_cow(h: i64, src: i64) -> i64 {
+    var nh = tbl_cow(h)
+    tbl_push(nh, src)
+    return nh
+}
+
+}
+

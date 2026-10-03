@@ -1,0 +1,100 @@
+type tie<logic, unsafe:mem>
+// ============================================================
+// trm-lite tl_tbl 写时复制单测（r.1.6.8）
+// 覆盖：独占不克隆 / 共享克隆 / 克隆后两表互不影响（隔离性）/
+//       克隆表数据完整 / 引用计数守恒。
+// 期望输出：exclusive_same=1 shared_differ=1 cloned_len=3
+//           orig_rc=1 cloned_rc=1 isolated=1 freed_ok=1
+// ============================================================
+import "../../core/tbl/tl_tbl.tie"
+
+// 读句柄字段的低位字节（探针只关心小值：rc/len 均 < 256）
+unsafe func rd(h: i64, off: i64) -> i64 {
+    return deref(int_to_ptr(h + off))
+}
+
+func main() {
+    var fails: i64 = 0
+    unsafe {
+        // ---- 建表并填 3 个元素 ----
+        var h = tl_tbl.tbl_new(8)
+        var d = tl_tbl.tbl_ensure(h, 3)
+        deref_write(int_to_ptr(d + 0), 11)
+        deref_write(int_to_ptr(d + 8), 22)
+        deref_write(int_to_ptr(d + 16), 33)
+        tl_tbl.tbl_set_len(h, 3)
+
+        // ---- 独占：cow 必须原样返回（零额外成本路径）----
+        var c1 = tl_tbl.tbl_cow(h)
+        if c1 == h {
+            println("exclusive_same=1")
+        } else {
+            fails = fails + 1
+            println("exclusive_same=0")
+        }
+
+        // ---- 制造共享：retain ⇒ rc=2（模拟 var b = a）----
+        tl_tbl.tbl_retain(h)
+
+        // ---- 共享：cow 必须克隆出新句柄 ----
+        var c2 = tl_tbl.tbl_cow(h)
+        if c2 != h {
+            println("shared_differ=1")
+        } else {
+            fails = fails + 1
+            println("shared_differ=0")
+        }
+
+        // ---- 克隆表数据完整（3 个元素都复制过来）----
+        var n2 = tl_tbl.tbl_len(c2)
+        if n2 == 3 {
+            println("cloned_len=3")
+        } else {
+            fails = fails + 1
+            println("cloned_len=" + to_string(n2))
+        }
+
+        // ---- 引用计数守恒：cow 后旧表让出一份 ⇒ 回 1；新表为 1 ----
+        var rc_old = rd(h, 40)
+        var rc_new = rd(c2, 40)
+        println("orig_rc=" + to_string(rc_old))
+        println("cloned_rc=" + to_string(rc_new))
+        if rc_old != 1 || rc_new != 1 {
+            fails = fails + 1
+        }
+
+        // ---- 隔离性：往旧表 push，新表长度必须不变 ----
+        var sv = alloc(8)
+        deref_write(sv, 99)
+        tl_tbl.tbl_push(h, ptr_to_int(sv))
+        var na = tl_tbl.tbl_len(h)
+        var nb = tl_tbl.tbl_len(c2)
+        if na == 4 && nb == 3 {
+            println("isolated=1")
+        } else {
+            fails = fails + 1
+            println("isolated=0 old=" + to_string(na) + " new=" + to_string(nb))
+        }
+
+        // ---- 克隆体首元素值与源一致（数据是拷贝不是空壳）----
+        var out = alloc(8)
+        tl_tbl.tbl_at(c2, 0, ptr_to_int(out))
+        if deref(out) == 11 {
+            println("data_copied=1")
+        } else {
+            fails = fails + 1
+            println("data_copied=0 got=" + to_string(deref(out)))
+        }
+
+        // ---- 释放无崩溃（rc 归零走 free 路径）----
+        tl_tbl.tbl_release(c2)
+        tl_tbl.tbl_release(h)
+        println("freed_ok=1")
+
+        if fails > 0 {
+            println("TBL_COW FAIL(" + to_string(fails) + ")")
+        } else {
+            println("TBL_COW PASS")
+        }
+    }
+}
