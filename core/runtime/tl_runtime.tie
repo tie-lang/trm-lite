@@ -12,6 +12,13 @@ type tie<class>
 import "../../core/mnn/sched.tie"
 import "../../core/gc/gc.tie"
 import "../../core/tbl/tl_tbl.tie"
+// 2026-03-03：补 tl_sync —— tiec 的 actor 消息投递会**主动生成** `tl_sync$sleep(1)`
+// 背压轮询调用（见 compiler/backend/irgen_rt_p2.tie 的 actor 背压段），而本文件是
+// trm-lite 的**唯一构建入口**（`tiec core/runtime/tl_runtime.tie -o trm_lite.a`）。
+// 缺这条 import ⇒ 库不含 `tl_sync$sleep` ⇒ **任何 actor 程序链接必然失败**
+// （实测 LNK2019 undefined `tl_sync$sleep`）。tl_sync 只依赖 tl_k32（纯 extern 声明），
+// 无循环风险。
+import "../../core/mnn/tl_sync.tie"
 
 namespace tl_runtime {
 
