@@ -420,7 +420,7 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
     var len = r_i64(p, 8)
     var esz = r_i64(p, 24)             // 含深表标记位
     var pure = esz & TBL_MASK
-    var deep = (esz & TBL_DEEP) != 0
+    var isdeep = (esz & TBL_DEEP) != 0
     var nh = alloc(48)                 // nh 已是 ptr（同 tbl_new 的 h）
     var ncap: i64 = 0
     var ndata: i64 = 0
@@ -440,7 +440,7 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
         InitializeCriticalSection(ptr_to_int(lk));
     }
     w_i64(nh, 32, ptr_to_int(lk))
-    if deep {
+    if isdeep {
         var i: i64 = 0
         while i < len {
             var eh = r_i64(int_to_ptr(ndata + i * 8), 0)
@@ -453,8 +453,23 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
     return ptr_to_int(nh)
 }
 
+// 无条件克隆（r.1.6.11）：返回全新句柄，与源**完全独立**（独立 data 缓冲 + 独立锁）。
+// 与 tbl_cow 的区别：**不读引用计数**。原因：struct 按值拷贝**不会 retain 其表字段**
+//（实测：按值传参发射的是整 struct 的 `store`，不含逐字段 retain），故 rc ≠ 别名数，
+// 靠它判「是否共享」会漏判。`deep` 形参的语义是「无条件独立」，所以用它。
+// 深表逐元素 retain（两侧各自持有元素引用，守恒）。
+pub unsafe fn tbl_clone(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    return tbl_clone_body(h)
+}
+
 // 分离：共享（rc>1）→ 克隆并放弃对旧表的一次引用；独占 → 原样返回。
 // 返回值即调用方应当写回自己槽的句柄。
+// ⚠ 依赖 rc 准确；见 tbl_clone 关于「struct 拷贝不 retain 表字段」的说明——在那种
+//   形态下 rc 偏低，本函数会误判为独占。仅用于**已确认 rc 可信**的场景（同函数内
+//   由 tiec 插桩 retain/release 的表变量）。
 pub unsafe fn tbl_cow(h: i64) -> i64 {
     if h == 0 {
         return 0
