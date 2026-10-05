@@ -28,7 +28,7 @@ unsafe func read_at(h: i64, i: i64) -> (i64, i64) {
 }
 
 // 共享表值域覆盖测试用
-unsafe func mark_seen(h: i64, seen: table<i64>) -> i64 {
+unsafe func mark_seen(h: i64, ref seen: table<i64>) -> i64 {
     var p: i64 = 0
     var cnt: i64 = 0
     while p < tl_tbl.tbl_len(h) {
