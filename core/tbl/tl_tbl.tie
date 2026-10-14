@@ -386,6 +386,108 @@ pub unsafe fn tbl_push_nl(h: i64, src: i64) {
     w_i64(p, 8, need)
 }
 
+// ==================== 批量追加（appfuse 融合 pass 与 `table_append` 内置的底座） ====================
+// 语义：把 src 前 n 个元素批量追加到 dst 尾（n 钳制 [0, len(src)]；元素宽以 dst 的
+// esz 为准，调用方/编译器保证两侧元素类型一致）。与「连续 n 次 tbl_push」（同扩容
+// 规则、同 len 提交）逐元素等价，但把 N 次加锁/字段重读/调用粗化成 1 次 + 一段 memcpy。
+//
+// 自追加守卫（hd == hs）：逐元素循环在 dst==src 时会因 len 增长而**永不终止**
+// （调用方侧本已是死循环缺陷）；批量形态不做同款死循环——以「进入时刻的 len」为
+// 源快照，单次定容后在单缓冲内**后向**逐元素拷贝（目标恒在源之后，后向序不会覆盖
+// 尚未读取的源元素）。
+//
+// 加锁族对 (dst, src) 双锁：按**句柄地址序**获取（各双锁站点顺序一致 ⇒ 无死锁环；
+// 持锁期不调用外部、不重入）；免锁族（_nl）与加锁族共用同一拷贝骨架，选择权在
+// 编译器（独占分析 / lock 持证作用域）。
+pub unsafe fn tbl_append_tbl(hd: i64, hs: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(hd), 8)
+    }
+    if hd == hs {
+        lock_enter(hd)
+        var r0 = append_tbl_body(hd, hs, n)
+        lock_leave(hd)
+        return r0
+    }
+    var l1 = hd
+    var l2 = hs
+    if l1 > l2 {
+        l1 = hs
+        l2 = hd
+    }
+    lock_enter(l1)
+    lock_enter(l2)
+    var r = append_tbl_body(hd, hs, n)
+    lock_leave(l2)
+    lock_leave(l1)
+    return r
+}
+
+pub unsafe fn tbl_append_tbl_nl(hd: i64, hs: i64, n: i64) -> i64 {
+    return append_tbl_body(hd, hs, n)
+}
+
+// 拷贝骨架（调用方已按需持锁；自追加守卫在此）。
+unsafe fn append_tbl_body(hd: i64, hs: i64, n: i64) -> i64 {
+    var pd = int_to_ptr(hd)
+    var ps = int_to_ptr(hs)
+    var len_s = r_i64(ps, 8)
+    if n > len_s {
+        n = len_s
+    }
+    if n <= 0 {
+        return r_i64(pd, 8)
+    }
+    var esz = r_i64(pd, 24) & TBL_MASK
+    if hd == hs {
+        var len0 = r_i64(pd, 8)
+        var need0 = len0 + n
+        var data0 = grow(pd, r_i64(pd, 0), len0, r_i64(pd, 16), esz, need0)
+        var k = n
+        while k > 0 {
+            k = k - 1
+            memcpy(int_to_ptr(data0 + (len0 + k) * esz), int_to_ptr(data0 + k * esz), esz)
+        }
+        w_i64(pd, 8, need0)
+        return need0
+    }
+    var data_s = r_i64(ps, 16)
+    var len_d = r_i64(pd, 8)
+    var need = len_d + n
+    var data_d = grow(pd, r_i64(pd, 0), len_d, r_i64(pd, 16), esz, need)
+    memcpy(int_to_ptr(data_d + len_d * esz), int_to_ptr(data_s), n * esz)
+    w_i64(pd, 8, need)
+    return need
+}
+
+// 批量零填充：追加 n 个「全零字节」元素。语义同 n 次「push 零元素」，一次定容 +
+// memset。调用方保证元素类型零值 = 全零字节（string 表禁用——string 的零值须为
+// 合法 "" 指针，由编译器侧把关）。
+pub unsafe fn tbl_append_zeros(h: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(h), 8)
+    }
+    lock_enter(h)
+    var r = append_zeros_body(h, n)
+    lock_leave(h)
+    return r
+}
+
+pub unsafe fn tbl_append_zeros_nl(h: i64, n: i64) -> i64 {
+    return append_zeros_body(h, n)
+}
+
+unsafe fn append_zeros_body(h: i64, n: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + n
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    memset(int_to_ptr(data + len * esz), 0, n * esz)
+    w_i64(p, 8, need)
+    return need
+}
+
 // ==================== 写时复制（r.1.6.8，非 unsafe 区的默认写入前提） ====================
 // **解决什么**：共享句柄的两个别名（`var b = a`，rc=2）在写入时互相可见——
 // 更严重的是**越界写自动扩容（p.9.12.2）会改写共享的 len/cap**，于是

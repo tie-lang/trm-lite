@@ -1,0 +1,119 @@
+type tie<logic, unsafe:mem>
+// ============================================================
+// trm-lite tl_tbl 批量追加/零填充探针（appfuse 融合 pass 与 table_append 内置的底座）
+// 覆盖：tbl_append_tbl / _nl（逐元素等价、n 钳制、n<=0）、tbl_append_zeros / _nl、
+//       自追加守卫（dst==src，含扩容换址）、跨扩容边界追加。
+// 期望输出：PASS all（布尔断言逐条；元素值取 <256——deref 为 ptr<u8> 单字节读）
+// ============================================================
+import "../../core/tbl/tl_tbl.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// 建源表（n 个 i64 元素，值 = base + k）
+unsafe fn mktbl(n: i64, base: i64) -> i64 {
+    var h = tl_tbl.tbl_new(8)
+    var k: i64 = 0
+    while k < n {
+        pushv(h, base + k)
+        k = k + 1
+    }
+    return h
+}
+
+// 读第 i 个元素（越界/失败返回 -1）
+unsafe fn elem(h: i64, i: i64) -> i64 {
+    var n = tl_tbl.tbl_len(h)
+    if i < 0 || i >= n {
+        return 0 - 1
+    }
+    var out = alloc(8)
+    var ok = tl_tbl.tbl_at(h, i, ptr_to_int(out))
+    if ok == 0 {
+        return 0 - 1
+    }
+    return deref(out)
+}
+
+unsafe fn pushv(h: i64, v: i64) {
+    var slot = alloc(8)
+    deref_write(int_to_ptr(ptr_to_int(slot)), v)
+    tl_tbl.tbl_push(h, ptr_to_int(slot))
+}
+
+func main() {
+    unsafe {
+        // ---------- 1) append_tbl 与连续 push 逐元素等价 ----------
+        var d = tl_tbl.tbl_new(8)
+        var s5 = mktbl(5, 10)
+        var n1 = tl_tbl.tbl_append_tbl(d, s5, 5)
+        check(n1 == 5 && tl_tbl.tbl_len(d) == 5, "append_tbl 追加 5（len=5）")
+        var eq: i64 = 1
+        var k: i64 = 0
+        while k < 5 {
+            if elem(d, k) != 10 + k {
+                eq = 0
+            }
+            k = k + 1
+        }
+        check(eq == 1, "append_tbl 逐元素与 push 等价")
+
+        // ---------- 2) 钳制 / n<=0 ----------
+        var n2 = tl_tbl.tbl_append_tbl(d, s5, 9)
+        check(n2 == 10 && tl_tbl.tbl_len(d) == 10, "n 超长钳到 len(src)（len=10）")
+        var n3 = tl_tbl.tbl_append_tbl(d, s5, 0)
+        var n4 = tl_tbl.tbl_append_tbl(d, s5, 0 - 3)
+        check(n3 == 10 && n4 == 10 && tl_tbl.tbl_len(d) == 10, "n<=0 为 no-op 且返回当前 len")
+
+        // ---------- 3) 跨扩容边界 ----------
+        var s10 = mktbl(10, 100)
+        var n5 = tl_tbl.tbl_append_tbl(d, s10, 10)
+        check(n5 == 20 && elem(d, 10) == 100 && elem(d, 19) == 109, "跨扩容边界追加 10")
+
+        // ---------- 4) zeros ----------
+        var z = tl_tbl.tbl_new(8)
+        var n6 = tl_tbl.tbl_append_zeros(z, 4)
+        check(n6 == 4 && elem(z, 0) == 0 && elem(z, 3) == 0, "zeros 追加 4 个零元素")
+        var n7 = tl_tbl.tbl_append_zeros(z, 0)
+        check(n7 == 4, "zeros n=0 no-op")
+        var n8 = tl_tbl.tbl_append_tbl(z, s5, 2)
+        check(n8 == 6 && elem(z, 4) == 10 && elem(z, 5) == 11, "zeros 之后 append 位置正确")
+
+        // ---------- 5) 自追加守卫（含跨扩容换址） ----------
+        var a = tl_tbl.tbl_new(8)
+        pushv(a, 1)
+        pushv(a, 2)
+        var n9 = tl_tbl.tbl_append_tbl(a, a, 2)
+        check(n9 == 4 && elem(a, 0) == 1 && elem(a, 1) == 2 && elem(a, 2) == 1 && elem(a, 3) == 2, "自追加 [1,2] 得 [1,2,1,2]")
+        var b = tl_tbl.tbl_new(8)
+        var kb: i64 = 0
+        while kb < 7 {
+            pushv(b, kb + 1)
+            kb = kb + 1
+        }
+        var n10 = tl_tbl.tbl_append_tbl(b, b, 7)
+        check(n10 == 14 && elem(b, 7) == 1 && elem(b, 13) == 7, "自追加跨扩容换址正确")
+
+        // ---------- 6) _nl 族与加锁族同义 ----------
+        var c = tl_tbl.tbl_new(8)
+        var m1 = tl_tbl.tbl_append_tbl_nl(c, s5, 3)
+        var m2 = tl_tbl.tbl_append_zeros_nl(c, 2)
+        var m3 = tl_tbl.tbl_append_tbl_nl(c, c, 5)
+        check(m1 == 3 && m2 == 5 && m3 == 10, "_nl 族长度正确（含自追加）")
+        check(elem(c, 3) == 0 && elem(c, 5) == 10 && elem(c, 7) == 12, "_nl 族元素正确")
+
+        if fails == 0 {
+            println("PASS all")
+        } else {
+            println("FAIL count = " + to_string(fails))
+        }
+    }
+}
