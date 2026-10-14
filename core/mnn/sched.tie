@@ -640,7 +640,9 @@ pub func pp_workers() -> i64 {
 
 // 提交 n 个 fn() -> i64 任务：池内并行执行、阻塞至全部完成，结果按序追加进
 // res（调用方提供的 table<i64> 句柄），返回实际完成数 min(n, len(fs))。
-pub func pp_submit(fs: table<fn() -> i64>, n: i64, res: table<i64>) -> i64 {
+// res 为 `ref`（2026-10-14 对齐规范 §13.1）：按值形参在值语义下写入不可观测，
+// 结果会静默丢失；ref 直写使「追加进调用方表」的契约成立。
+pub func pp_submit(fs: table<fn() -> i64>, n: i64, ref res: table<i64>) -> i64 {
     ensure()
     var m = n
     var fl = len(fs)
