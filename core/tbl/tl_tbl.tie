@@ -246,6 +246,20 @@ pub unsafe fn tbl_push(h: i64, src: i64) {
 // 同一顺序、同一扩容规则、同一 len 提交），但把 N 次加锁粗化为 1 次，并省去 N-1 次
 // 字段重读。这是**不改变任何并发语义**的优化路径：原语层只是把 N 次操作放进同一个
 // 临界区。返回追加后的新长度。
+pub unsafe fn tbl_append_nl(h: i64, src: i64, n: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    if n <= 0 {
+        return len
+    }
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + n
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), n * esz)
+    w_i64(p, 8, need)
+    return need
+}
+
 pub unsafe fn tbl_append(h: i64, src: i64, n: i64) -> i64 {
     if n <= 0 {
         return r_i64(int_to_ptr(h), 8)
@@ -486,6 +500,140 @@ unsafe fn append_zeros_body(h: i64, n: i64) -> i64 {
     memset(int_to_ptr(data + len * esz), 0, n * esz)
     w_i64(p, 8, need)
     return need
+}
+
+// ---------- 批量追加常量（tbl_append_repeat）：src 指向的元素值重复 n 次 ----------
+// 用途：appfuse 的"常量填充循环"形状（`while i<n { table_push(dst, K) }`，K≠0 时
+// 无法用 zeros 入口）。宽度取 dst 的 esz；src 须指向合法元素槽（调用方备好）。
+pub unsafe fn tbl_append_repeat(h: i64, src: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(h), 8)
+    }
+    lock_enter(h)
+    var r = append_repeat_body(h, src, n)
+    lock_leave(h)
+    return r
+}
+
+pub unsafe fn tbl_append_repeat_nl(h: i64, src: i64, n: i64) -> i64 {
+    return append_repeat_body(h, src, n)
+}
+
+unsafe fn append_repeat_body(h: i64, src: i64, n: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + n
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    var k: i64 = 0
+    while k < n {
+        memcpy(int_to_ptr(data + (len + k) * esz), int_to_ptr(src), esz)
+        k = k + 1
+    }
+    w_i64(p, 8, need)
+    return need
+}
+
+// ---------- 批量追加常量（值在寄存器/立即数形态）：val 的 esz 字节重复 n 次 ----------
+// 与 tbl_append_repeat 同语义，但值**按值传入**（低 esz 字节即元素字节序）——供
+// appfuse 的常量填充形状直接改写（无需为值另建槽位）。
+pub unsafe fn tbl_append_repeat_v(h: i64, val: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(h), 8)
+    }
+    lock_enter(h)
+    var r = append_repeat_v_body(h, val, n)
+    lock_leave(h)
+    return r
+}
+
+pub unsafe fn tbl_append_repeat_v_nl(h: i64, val: i64, n: i64) -> i64 {
+    return append_repeat_v_body(h, val, n)
+}
+
+unsafe fn append_repeat_v_body(h: i64, val: i64, n: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + n
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    var k: i64 = 0
+    while k < n {
+        memcpy(int_to_ptr(data + (len + k) * esz), int_to_ptr(ptr_to_int(addr_of(val))), esz)
+        k = k + 1
+    }
+    w_i64(p, 8, need)
+    return need
+}
+
+// ---------- 区间复制（tbl_copy_from）：dst[off .. off+n) = src[0 .. n) ----------
+// 语义与"逐元素 dst[off+i] = src[i]"的**独占表**路径等价：
+//   * n 钳到 len(src)；off < 0 钳 0；n<=0 为 no-op；
+//   * dst 需扩到 off+n；中间空隙（off > len_d 时）按**零值**填充——非字符串元素
+//     下与写路径的元素零值一致（字符串的 "" 语义由调用方把关，见 appfuse 门）；
+//   * 自复制（hd == hs）且 off>0：倒序拷贝（写高位不覆盖未读低位）。
+pub unsafe fn tbl_copy_from(hd: i64, off: i64, hs: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(hd), 8)
+    }
+    if hd == hs {
+        lock_enter(hd)
+        var r0 = copy_from_body(hd, off, hs, n)
+        lock_leave(hd)
+        return r0
+    }
+    var l1 = hd
+    var l2 = hs
+    if l1 > l2 {
+        l1 = hs
+        l2 = hd
+    }
+    lock_enter(l1)
+    lock_enter(l2)
+    var r = copy_from_body(hd, off, hs, n)
+    lock_leave(l2)
+    lock_leave(l1)
+    return r
+}
+
+pub unsafe fn tbl_copy_from_nl(hd: i64, off: i64, hs: i64, n: i64) -> i64 {
+    return copy_from_body(hd, off, hs, n)
+}
+
+unsafe fn copy_from_body(hd: i64, off: i64, hs: i64, n: i64) -> i64 {
+    var pd = int_to_ptr(hd)
+    var ps = int_to_ptr(hs)
+    var len_s = r_i64(ps, 8)
+    if n > len_s {
+        n = len_s
+    }
+    if off < 0 {
+        off = 0
+    }
+    if n <= 0 {
+        return r_i64(pd, 8)
+    }
+    var esz = r_i64(pd, 24) & TBL_MASK
+    var len_d = r_i64(pd, 8)
+    var need = off + n
+    var data_d = grow(pd, r_i64(pd, 0), len_d, r_i64(pd, 16), esz, need)
+    if off > len_d {
+        memset(int_to_ptr(data_d + len_d * esz), 0, (off - len_d) * esz)
+    }
+    if hd == hs {
+        // 同表：grow 后源数据即新缓冲；上移用倒序
+        var k = n
+        while k > 0 {
+            k = k - 1
+            memcpy(int_to_ptr(data_d + (off + k) * esz), int_to_ptr(data_d + k * esz), esz)
+        }
+    } else {
+        memcpy(int_to_ptr(data_d + off * esz), int_to_ptr(r_i64(ps, 16)), n * esz)
+    }
+    if need > len_d {
+        w_i64(pd, 8, need)
+    }
+    return r_i64(pd, 8)
 }
 
 // ==================== 写时复制（r.1.6.8，非 unsafe 区的默认写入前提） ====================

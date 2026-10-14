@@ -1,0 +1,115 @@
+type tie<logic, unsafe:mem>
+// ============================================================
+// trm-lite tl_tbl 批量追加扩展探针（r.1.7：appfuse 扩展形状的底座）
+// 覆盖：tbl_append_repeat / _nl（常量重复填充、n<=0 no-op、跨扩容边界）
+//       tbl_copy_from / _nl（区间复制、n 钳到 len(src)、off<0 钳 0、空隙零填充、
+//                            自复制上移倒序、跨扩容边界）
+// 期望输出：全部 PASS 行 + "PASS all"
+// ============================================================
+import "../../core/tbl/tl_tbl.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// 建表（n 个 i64，值 base+k）
+unsafe func mktbl(n: i64, base: i64) -> i64 {
+    var h = tl_tbl.tbl_new(8)
+    var k: i64 = 0
+    while k < n {
+        var v = base + k
+        tl_tbl.tbl_push_nl(h, ptr_to_int(addr_of(v)))
+        k = k + 1
+    }
+    return h
+}
+
+// 读第 i 个元素（i64；越界返回 -1）
+unsafe func rd64(h: i64, i: i64) -> i64 {
+    var n = tl_tbl.tbl_len(h)
+    if i < 0 || i >= n {
+        return 0 - 1
+    }
+    var out = alloc(8)
+    tl_tbl.tbl_at(h, i, ptr_to_int(out))
+    var v: i64 = 0
+    memcpy(int_to_ptr(ptr_to_int(addr_of(v))), out, 8)
+    return v
+}
+
+// 重复填充：val 重复 n 次
+unsafe func rep(h: i64, val: i64, n: i64) -> i64 {
+    var s = val
+    return tl_tbl.tbl_append_repeat(h, ptr_to_int(addr_of(s)), n)
+}
+
+unsafe func rep_nl(h: i64, val: i64, n: i64) -> i64 {
+    var s = val
+    return tl_tbl.tbl_append_repeat_nl(h, ptr_to_int(addr_of(s)), n)
+}
+
+func main() {
+    unsafe {
+        // ---- repeat：基本 + 值正确 ----
+        var h = tl_tbl.tbl_new(8)
+        var r1 = rep(h, 424242, 5)
+        check(r1 == 5 && tl_tbl.tbl_len(h) == 5, "repeat 追加 5（len=5）")
+        check(rd64(h, 0) == 424242 && rd64(h, 4) == 424242, "repeat 元素值正确")
+        // ---- repeat：n<=0 no-op ----
+        var r2 = rep(h, 9, 0)
+        check(r2 == 5 && tl_tbl.tbl_len(h) == 5, "repeat n=0 no-op")
+        var r3 = rep(h, 9, 0 - 3)
+        check(r3 == 5 && tl_tbl.tbl_len(h) == 5, "repeat n<0 no-op")
+        // ---- repeat：跨扩容边界（100 个）----
+        var r4 = rep(h, 7, 100)
+        check(r4 == 105 && tl_tbl.tbl_len(h) == 105, "repeat 跨扩容 100（len=105）")
+        check(rd64(h, 104) == 7 && rd64(h, 4) == 424242 && rd64(h, 5) == 7, "repeat 边界元素正确")
+        // ---- repeat _nl 族 ----
+        var h2 = tl_tbl.tbl_new(8)
+        var r5 = rep_nl(h2, 31337, 6)
+        check(r5 == 6 && rd64(h2, 5) == 31337, "_nl repeat 正确")
+
+        // ---- copy_from：基本（dst 追加区段）----
+        var src = mktbl(4, 100)
+        var d = tl_tbl.tbl_new(8)
+        var c1 = tl_tbl.tbl_copy_from(d, 0, src, 4)
+        check(c1 == 4 && rd64(d, 0) == 100 && rd64(d, 3) == 103, "copy_from 基本复制")
+        // ---- n 钳到 len(src) ----
+        var c2 = tl_tbl.tbl_copy_from(d, 4, src, 99)
+        check(c2 == 8 && rd64(d, 7) == 103, "copy_from n 钳到 len(src)")
+        // ---- off 负钳 0（覆盖式写回）----
+        var c3 = tl_tbl.tbl_copy_from(d, 0 - 5, src, 2)
+        check(c3 == 8 && rd64(d, 0) == 100 && rd64(d, 1) == 101, "copy_from off<0 钳 0")
+        // ---- 空隙零填充（off > len_d）----
+        var d2 = tl_tbl.tbl_new(8)
+        var c4 = tl_tbl.tbl_copy_from(d2, 3, src, 2)
+        check(c4 == 5 && rd64(d2, 0) == 0 && rd64(d2, 2) == 0 &&
+            rd64(d2, 3) == 100 && rd64(d2, 4) == 101, "copy_from 空隙零填充")
+        // ---- 自复制上移（倒序，不得自覆盖）----
+        var d3 = mktbl(4, 10)                     // 10 11 12 13
+        var c5 = tl_tbl.tbl_copy_from(d3, 2, d3, 2)  // 期望 10 11 10 11
+        check(c5 == 4 && rd64(d3, 0) == 10 && rd64(d3, 1) == 11 &&
+            rd64(d3, 2) == 10 && rd64(d3, 3) == 11, "copy_from 自复制上移倒序")
+        // ---- 跨扩容边界（dst 需扩张）----
+        var d4 = mktbl(2, 500)
+        var c6 = tl_tbl.tbl_copy_from(d4, 2, src, 4)
+        check(c6 == 6 && rd64(d4, 2) == 100 && rd64(d4, 5) == 103, "copy_from 跨扩容")
+        // ---- _nl 族 ----
+        var d5 = tl_tbl.tbl_new(8)
+        var c7 = tl_tbl.tbl_copy_from_nl(d5, 1, src, 3)
+        check(c7 == 4 && rd64(d5, 1) == 100 && rd64(d5, 3) == 102, "_nl copy_from 正确")
+
+        if fails == 0 {
+            println("PASS all")
+        } else {
+            println("FAIL count=" + to_string(fails))
+        }
+    }
+}
