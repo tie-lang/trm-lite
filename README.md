@@ -259,16 +259,25 @@ trm-lite 的同步/线程原语按**同一份 tie 源码**平台分支，不 for
 ### Linux 构建约定（交叉构建 trm_lite_linux.a）
 
 ```powershell
-# Windows（既有，kernel32 解析）：四成员 trm_lite.a
+# Windows（既有，kernel32 解析）：三成员 trm_lite.a
 tiec core/runtime/tl_runtime.tie -o rt.a
 tiec tl_chan_lib.tie -o chan.a
 tiec wg_lib.tie -o wg.a
-tiec tl_gen_lib.tie -o gen.a
-# 提取 .o 后合并：llvm-ar rcs trm_lite.a tl_runtime.o tl_chan_lib.o wg_lib.o tl_gen_lib.o
-# （tl_gen_lib.o = p.9.5.1/p.9.5.2 生成器式协程切面；独立成员防内联 import 程序
-#   链接期重复定义，与 chan/wg 同策略）
+# 提取 .o 后合并：llvm-ar rcs trm_lite.a tl_runtime.o tl_chan_lib.o wg_lib.o
+#
+# r.1.7 成员构成变更（多重定义修复，务必遵守）：
+#   * rt 不再内联 tl_sync（tl_runtime.tie 的该 import 已去）——tl_chan_lib.o 同样
+#     内联 tl_sync，二者同档会 COFF 多重定义（LNK2005）。**tl_sync 由 chan 成员
+#     提供**（rt 自身已无 tl_sync 引用，纯表程序不会因此拉入 chan）；这与
+#     tl_tbl.tie 头注释记录的纪律同源（「库成员不内联 tl_sync」）。
+#   * tl_gen_lib.o 退出归档：它内联 tl_tbl、与 rt 重叠 43 个符号，而**无内置**发射
+#     tl_gen$*（生成器库按 import 使用）⇒ 入档只会埋雷；需要时另行入档。
+#   * （后续可做）把 tl_chan.tie 的锁原语改为自持 tl_k32 extern（同 tl_tbl 先例），
+#     再抽独立 `tl_sync.o` 成员，可让 chan 不再携带 tl_sync。
+#   * 合成后必须做重复扫描（应为空）：
+#     nm -A <ar> | awk '$2 ~ /^[TtWwDd]$/ {print $NF}' | sort | uniq -d
 
-# Linux（pthread 解析）：五成员 trm_lite_linux.a（--target 交叉目标，clang -c 无链接无需 sysroot）
+# Linux（pthread 解析）：六成员 trm_lite_linux.a（--target 交叉目标，clang -c 无链接无需 sysroot）
 tiec core/runtime/tl_runtime.tie -o rt_linux.a --target x86_64-unknown-linux-gnu
 tiec tl_chan_lib.tie -o chan_linux.a --target x86_64-unknown-linux-gnu
 tiec wg_lib.tie -o wg_linux.a --target x86_64-unknown-linux-gnu

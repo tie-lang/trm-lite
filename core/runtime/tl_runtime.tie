@@ -15,10 +15,15 @@ import "../../core/tbl/tl_tbl.tie"
 // 2026-03-03：补 tl_sync —— tiec 的 actor 消息投递会**主动生成** `tl_sync$sleep(1)`
 // 背压轮询调用（见 compiler/backend/irgen_rt_p2.tie 的 actor 背压段），而本文件是
 // trm-lite 的**唯一构建入口**（`tiec core/runtime/tl_runtime.tie -o trm_lite.a`）。
-// 缺这条 import ⇒ 库不含 `tl_sync$sleep` ⇒ **任何 actor 程序链接必然失败**
+// 缺 tl_sync ⇒ 库不含 `tl_sync$sleep` ⇒ **任何 actor 程序链接必然失败**
 // （实测 LNK2019 undefined `tl_sync$sleep`）。tl_sync 只依赖 tl_k32（纯 extern 声明），
 // 无循环风险。
-import "../../core/mnn/tl_sync.tie"
+//
+// r.1.7 改多成员归档：**不再在此内联 import tl_sync**，改由归档的独立成员
+// `tl_sync.o` 提供（构建式见 README）。理由：tl_chan_lib.o 同样内联 tl_sync，两者
+// 同档共存会**多重定义**（COFF 链接期 LNK2005；tl_tbl.tie 头注释早已记录同一条
+// 纪律——"库成员不内联 tl_sync"）。rt 自身的 tl_sync 引用由归档成员解析。
+// 单成员用法（只 `-o x.a` 本文件）需自行补 `tl_sync.o`。
 
 namespace tl_runtime {
 
