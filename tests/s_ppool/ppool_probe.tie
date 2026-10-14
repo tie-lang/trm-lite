@@ -1,4 +1,4 @@
-type tie<logic>
+type tie<logic, unsafe:share>
 // tests/s_ppool/ppool_probe.tie —— p.9.5.x 并行池 API（trm_lite_ppool）探针
 // 覆盖：
 //   1. 多任务并行执行正确性：8 个任务各累加独立计数器 g_cnt[i]（i64 槽零竞争）、
@@ -9,6 +9,8 @@ type tie<logic>
 //   4. void 任务：pp_submit_void 计数正确。
 // 构建约束：import sched（含 trm_lite_ppool）+ tl_tbl（内联桥）→ tbl_inlined_check
 // 命中 → 编译器不追加 trm_lite.a → 单对象自包含、零链接期重复符号。
+// 并发门禁：文件头 unsafe:share 持证 + 提交点 unsafe 块（E00903/E00904）；并发写入由
+// 书写者负责排除（本探针每任务只写独立 i64 槽）。
 import "../../core/mnn/sched.tie"
 import "../../core/tbl/tl_tbl.tie"
 
@@ -45,7 +47,12 @@ func main() {
         i = i + 1
     }
     var res: table<i64> = table_new_i64()
-    var done = trm_lite_ppool.pp_submit(fs, 8, res)
+    // E00903：引用全局可变容器的闭包交给执行流须在 unsafe 块中（share 域凭据由文件头持）。
+    // 并发排除：每任务只写 g_cnt[iv] 独立槽（i64 槽零竞争），无共享读改写。
+    var done: i64 = 0
+    unsafe {
+        done = trm_lite_ppool.pp_submit(fs, 8, res)
+    }
     println("[batch1] done=" + to_string(done) + " res_len=" + to_string(len(res)))
     if done != 8 || len(res) != 8 {
         println("FAIL: 批次1 完成数/结果数应为 8")
@@ -88,7 +95,10 @@ func main() {
         i = i + 1
     }
     var res2: table<i64> = table_new_i64()
-    var done2 = trm_lite_ppool.pp_submit(fs2, 4, res2)
+    var done2: i64 = 0
+    unsafe {
+        done2 = trm_lite_ppool.pp_submit(fs2, 4, res2)
+    }
     var tc = trm_lite_ppool.pp_thread_count()
     var wr0b = trm_lite_ppool.pp_worker_runs(0)
     var wr1b = trm_lite_ppool.pp_worker_runs(1)
@@ -128,7 +138,10 @@ func main() {
         })
         i = i + 1
     }
-    var donev = trm_lite_ppool.pp_submit_void(fsv, 3)
+    var donev: i64 = 0
+    unsafe {
+        donev = trm_lite_ppool.pp_submit_void(fsv, 3)
+    }
     println("[void] done=" + to_string(donev))
     if donev != 3 {
         println("FAIL: void 提交完成数应为 3")

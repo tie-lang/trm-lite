@@ -1,4 +1,4 @@
-type tie<logic, unsafe:mem>
+type tie<logic, unsafe:mem, unsafe:share>
 // tests/s_tbl/tl_tbl_conc_probe.tie —— 表容器并发正确性验证
 // ---------------------------------------------------------------------------
 // 用途：
@@ -102,7 +102,13 @@ func main() {
         w = w + 1
     }
     var res: table<i64> = table_new_i64()
-    var done = trm_lite_ppool.pp_submit(fs, W, res)
+    var done: i64 = 0
+    // E00903：引用全局可变容器的闭包交给执行流须在 unsafe 块中（并发写入由书写者负责排除：
+    // 本探针正是要验证 tl_tbl 加锁路径在共享写下的正确性，故此处显式走 unsafe；
+    // share 域凭据由文件头 `unsafe:share` 持）。
+    unsafe {
+        done = trm_lite_ppool.pp_submit(fs, W, res)
+    }
     trm_lite_ppool.pp_close()
 
     var want = W * PER
