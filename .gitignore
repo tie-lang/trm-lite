@@ -20,3 +20,8 @@ tie.lock
 # 系统
 .DS_Store
 Thumbs.db
+# 构建符号表（与 tiel 同惯例）
+*.sym.zd
+
+# 本地验证工作区
+_tiec_verify/
